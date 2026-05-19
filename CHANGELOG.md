@@ -11,6 +11,112 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/)
 for the fork-side suffix.
 
+## [1.0.0-alpha.2.1] — 2026-05-19
+
+**Defensive-hardening release.** Two coordinated patch series targeting
+USB enumeration freezes and OHCI DMA-structure page-crossing risks.
+Both patch series are also open as PRs against upstream `crazii/USBDDOS`
+(PR #31 and PR #32 in this fork's release set) and are carried as
+fork-side commits in the alpha.2.1 binaries until they merge upstream.
+
+This is NOT a housekeeping release. There are real code changes
+affecting the descriptor walker, the OHCI allocator, the USBALLOC pool
+arenas, and the DJGPP DPMI no-page-crossing allocator. If you're
+running alpha.2 and have hit the unsupported-class enumeration freeze
+(typically: USB audio or wireless-USB devices behind a hub alongside
+HID devices), or if you suspect OHCI DMA corruption on hosts where the
+DPMI host returns a non-page-aligned XMS mapping (HDPMI32 specifically),
+alpha.2.1 is the recommended upgrade.
+
+**Alpha designation (carried forward unchanged from alpha.2)**:
+real-hardware verification on the silicon the patches target is still
+pending. The four edits in Gap I and the macro-override fix in Gap H
+were verified in QEMU OHCI + usb-audio and via a native-Linux unit
+test exercising the descriptor parser against synthetic descriptors,
+but real-hardware report against the original tester's KT133A+NEC
+configuration has not yet been received.
+
+### Added
+* **Gap I (PR #31)**: Harden `USB_ParseConfiguration` against malformed
+  descriptors and improve unsupported-class diagnostics. Four edits in
+  `USBDDOS/usb.c` plus one new constant in `USBDDOS/usb.h`:
+  * Improved no-driver-found log surfaces the full
+    `bDeviceClass/bDeviceSubClass/bDeviceProtocol` triplet plus a
+    human-readable class name (`audio`, `wireless`, `miscellaneous(IAD)`,
+    `vendor`, etc.) — was: `class 01`; now: `class 01/01/04 audio`.
+  * Explicit Interface Association Descriptor (`USB_DT_INTERFACE_ASSOCIATION
+    = 0x0B`) recognition in the descriptor walker, with informational
+    `_LOG` of `firstIf`/`count`/`funcClass`. No semantic change — USBDDOS
+    continues to bind class drivers at device level, not function level,
+    and does NOT use IAD's `bFunctionClass` for driver lookup.
+  * `bNumInterfaces > 32` cap mirroring Linux's
+    `USB_QUIRK_HONOR_BNUMINTERFACES` defensive pattern. The cap value
+    is persisted to `pConfigList[].bNumInterfaces` so subsequent malloc
+    and memset operate on the same size (regression guard against
+    heap buffer overrun).
+  * Zero-length descriptor defensive break: `if (len == 0) break;`
+    in the walker loop. Without this, a malformed device emitting any
+    descriptor with `bLength = 0` causes a hard infinite loop on
+    `i = i + len`. Strong candidate fix for the tester's
+    KT133A+NEC+mixed-class-hub freeze.
+* **Gap H (PR #32)**: Enforce no-page-crossing for OHCI DMA structures
+  + fix `DPMI_DMAMallocNCPB` linear-address check. Three coordinated
+  changes:
+  * `USBDDOS/HCD/ohci.c`: apply the `DPMI_DMAMalloc → DPMI_DMAMallocNCPB`
+    macro override at the top of the file, mirroring the pattern EHCI
+    has used since its bring-up (`ehci.c:25-30`). OHCI's HCData
+    allocation is the highest-risk site: it embeds the 256-byte HCCA
+    plus 8 static EDs (~548 bytes total) and a plain `DPMI_DMAMalloc`
+    could place it straddling a 4KB page boundary, silently breaking
+    DMA for either the HCCA or the static EDs.
+  * `USBDDOS/HCD/ohci.c`: add DEBUG-build defense-in-depth assertions
+    at the HCCA register-write site verifying the produced allocation
+    actually fits within a single physical page.
+  * `USBDDOS/usballoc.c`: switch pool-arena allocations (both the
+    on-demand `USBALLOC_GetMemory` path and the `USBALLOC_Init`
+    pre-allocation path) from `DPMI_DMAMalloc` to `DPMI_DMAMallocNCPB`.
+    Variable-size paths stay on plain `DMAMalloc` because transfer
+    buffers may legitimately exceed a page (OHCI § 3.1.1.1 supports
+    buffers spanning one page boundary via the TD's `CBP`/`BE`
+    mechanism).
+
+### Fixed
+* **`DPMI_DMAMallocNCPB` in `dpmi_dj2.c`** (DJGPP build path) was
+  checking page boundaries in C-pointer-relative space rather than
+  linear-address space. Under HDPMI32 with a non-page-aligned XMS
+  mapping base — observed `XMS lbase 002e1c00` (offset `0xC00` within
+  its page) on QEMU — C-pointer "pages" and linear "pages" live on
+  different grids offset by `(DPMI_DSBase & 0xFFF)`. An allocation
+  that NCPB previously declared page-contained in C-pointer space
+  could still straddle a linear page boundary, which is what the
+  hardware sees for DMA. The fix translates via `DPMI_DSBase` before
+  the boundary test. The Watcom/Borland path (`dpmi_bc.cpp:991`) was
+  already correct — it uses `DPMI_PTR2L(ptr)` to get the linear
+  address before the check, so only the DJGPP build was affected.
+  EHCI was latently exposed to the same bug since its bring-up but
+  evidently has not been hit in practice because its DMA structures
+  (QH 96B, QTD 32B, iTD 64B) are small enough that the probability of
+  crossing a linear-page boundary is much lower than for OHCI's
+  548-byte HCData.
+
+### Notes
+* **No CWSDPMI/HDPMI32 swap recommended.** The NCPB fix is in the
+  DJGPP build path (`USBDDOSP.EXE`). The Watcom build (`USBDDOS.EXE`)
+  was never affected. Both DPMI hosts that the DJGPP build supports
+  (CWSDPMI and HDPMI32) work with alpha.2.1; the latent bug surfaces
+  whichever host you use, since it depends only on the XMS heap's
+  linear-base alignment, not on the DPMI host itself.
+* **QEMU regression test coverage**: 7-test ladder still passes 7/7,
+  plus an 8th test case (OHCI + usb-audio with HDPMI32 capturing the
+  graceful-skip log line) passes. A native-Linux unit test
+  (`test_parser.c`, 5 cases) exercises the descriptor parser against
+  synthetic audio/IAD/oversized-bNumInterfaces/zero-length descriptors
+  in isolation; all 5 cases pass.
+* **Binary size**: Watcom `USBDDOS.EXE` is `~65 KB` (release) /
+  `~95 KB` (debug). DJGPP `USBDDOSP.EXE` is `~208 KB` (release) /
+  `~368 KB` (debug). All four build clean with the project's existing
+  `-Werror -Wconversion -Wsign-compare -pedantic-errors` flag set.
+
 ## [1.0.0-alpha.2] — 2026-05-15
 
 **This is a housekeeping release.** No new code, no functional

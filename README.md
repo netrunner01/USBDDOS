@@ -2,32 +2,49 @@
 
 ## Status
 
-**Current version: `v1.0.0-alpha.2` (May 15, 2026)** — housekeeping
-release; no new code or features.
+**Current version: `v1.0.0-alpha.2.1` (May 19, 2026)** — defensive-
+hardening release; targets the USB-enumeration freeze on
+unsupported-class devices behind a hub, and the OHCI DMA-structure
+page-crossing risk under DPMI hosts that return a non-page-aligned
+XMS mapping.
 
-Every patch from `v1.0.0-alpha.1` was merged into upstream
-`crazii/USBDDOS` between May 13 and May 15, 2026. Upstream master is
-at `b1308fb`. The alpha.2 binaries on the release page are built
-directly from upstream master and are byte-identical (Watcom) or
-near-identical (DJGPP, differing only in an embedded build-hash) to
-the alpha.1 binaries. If alpha.1 is already running on your system,
-there is no reason to update; alpha.2 exists for build-provenance
-clarity, not as a functional change.
+This is NOT a housekeeping release like alpha.2 was. There are real
+code changes in `USBDDOS/usb.c` (descriptor parser hardening),
+`USBDDOS/HCD/ohci.c` (no-page-crossing DMA allocation), and
+`USBDDOS/DPMI/dpmi_dj2.c` (linear-address-space NCPB check fix).
+Two PRs are also open against upstream `crazii/USBDDOS` (PR #31 and
+PR #32 in this fork's release set); the alpha.2.1 binaries carry
+those patches as fork-side commits on top of upstream `b1308fb` until
+they merge upstream.
+
+If you're running alpha.2 and have hit the unsupported-class
+enumeration freeze (typical trigger: USB audio or wireless-USB devices
+behind a hub alongside HID devices, observed on KT133A + NEC µPD720101),
+or if you suspect OHCI DMA corruption on hosts that use HDPMI32 as the
+DJGPP DPMI server, alpha.2.1 is the recommended upgrade. If you're
+running alpha.1 or alpha.2 without those symptoms, the upgrade is
+optional but recommended.
 
 **The "alpha" label still means real-hardware verification is
 pending — NOT that the code is unstable or broken.** Specifically:
 
 * All upstream code builds clean with `-Werror` on Open Watcom v2 and
-  DJGPP gcc 12.2.0.
+  DJGPP gcc 12.2.0. Alpha.2.1 also builds clean with the same flags.
 * The 7-test QEMU regression suite passes 7/7
   (`ohci-init`, `ohci-kbd`, `ohci-msc`, `uhci-init`, `ehci-init`,
-  `ohci-hub-hid`, `ohci-audio`).
+  `ohci-hub-hid`, `ohci-audio`). Alpha.2.1 adds an 8th case
+  (`ohci-audio-graceful-skip` capturing the new diagnostic log line)
+  and a native-Linux unit test for the descriptor parser
+  (`test_parser.c`, 5 cases exercising audio/IAD/oversized-bNumInterfaces
+  /zero-length-descriptor paths) — all pass.
 * Every patch was derived from authoritative documentation: the
-  USB 2.0 spec (for the Gap 4 hub-class fix), Linux `pci-quirks.c`
-  and `ohci-hcd.c` (for Gaps 2, 3, 6), Apple Darwin `IOUSBFamily`
-  (for the pending Gap 7), the NEC µPD720101 / ALi M5237 / SiS 630 /
-  OPTi 82C861 chip datasheets, and Benjamin Lunt's FYSOS Book 8
-  (for Gap 8).
+  USB 2.0 spec (for the Gap 4 hub-class fix and Gap I's IAD ECN),
+  Linux `pci-quirks.c`, `ohci-hcd.c`, and `quirks.c` (for Gaps 2, 3,
+  6, and Gap I's `USB_QUIRK_HONOR_BNUMINTERFACES`), Apple Darwin
+  `IOUSBFamily` (for the pending Gap 7), the OHCI 1.0a spec (for
+  Gap H's page-crossing rules), the NEC µPD720101 / ALi M5237 /
+  SiS 630 / OPTi 82C861 chip datasheets, and Benjamin Lunt's FYSOS
+  Book 8 (for Gap 8).
 * What's still missing: a regression pass against the actual silicon
   each chip-quirk fix targets. QEMU implements *spec-compliant* USB
   devices; the patched paths exist precisely because real silicon
