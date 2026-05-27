@@ -219,15 +219,22 @@ BOOL USB_HID_InitDevice(USB_Device* pDevice)
             if(DrvIntface->pDataEP[HCD_TXR] != NULL && USB_SyncSendRequest(pDevice, &req, NULL) == 0)
                 ++valid;
 
-            //bye default the device will send data even if no input data change, set_idle will make it only sending data only changes, i.e. keydown/keyup
-            //maybe we can use the frequent interrupt to implement 'repeating'. otherwise we need a timer to implement it.
-            //now use non-idle to implement repeating, will save timer irq and DPMI RMCB, but use USB badwidth when a key is long pressed 
-            //for an 10ms rate keyboard, the bandwith will be 8*100=800 bytes per second
+            //by default the device will send data even if no input data change, set_idle will make it only sending data only changes, i.e. keydown/keyup
+            //the original code toggled between SET_IDLE(INDEFINITE) and SET_IDLE(MINIMAL) from
+            //USB_HID_InputKeyboard's interrupt-context callback (via async USB_SendRequest) to enable
+            //typematic repeat only when keys were held.  That async-from-IRQ dispatch violated
+            //EHCI_ControlTransfer's "no pending transfers" assumption (Gap-K, May 2026): a second async
+            //SET_IDLE arriving before the first completed could leave the control-pipe QH's Tail.Prev
+            //non-NULL, tripping an assertion in EHCI_ControlTransfer.  Workaround A: set MINIMAL idle
+            //rate once at install time and keep the device in that state permanently.  Reports come on
+            //every polling cycle whether keys are held or not.  Bandwidth cost is ~1 KB/sec per HID
+            //device on 12 Mbps USB (under 0.1%), negligible.  Removes the toggle entirely; the
+            //DrvIntface->Idle field becomes vestigial.
             _LOG("HID Set idle\n");
-            USB_Request req2 = {USB_REQ_WRITE | USB_REQ_TYPE_HID, USB_REQ_HID_SET_IDLE, USB_HID_MAKE_IDLE(USB_HID_IDLE_INDEFINITE, USB_HID_IDLE_REPORTALL) /*indefinite until input detected, all reports*/, 0, 0};
+            USB_Request req2 = {USB_REQ_WRITE | USB_REQ_TYPE_HID, USB_REQ_HID_SET_IDLE, USB_HID_MAKE_IDLE(1L, USB_HID_IDLE_REPORTALL) /*minimal idle, report every polling cycle - permanent*/, 0, 0};
             req2.wIndex = (uint16_t)DrvIntface->bInterface;
             USB_SyncSendRequest(pDevice, &req2, NULL);
-            DrvIntface->Idle = TRUE;
+            DrvIntface->Idle = FALSE; /*matches the SET_IDLE(1) state we just programmed*/
         }
     }
     DPMI_DMAFree(pDescBuffer);
@@ -582,21 +589,12 @@ static void USB_HID_InputKeyboard(USB_Device* pDevice)
     USB_HID_Data* prev = &kbd->Data[(kbd->Index+1)&0x1];
     BOOL empty = USB_HID_Keyboard_IsInputEmpty(data);
 
-    //change idle state
-    if(!empty && kbd->Idle) //stop idle if there'is key input, we use the non-idle interrupt to do repeating.
-    {
-        USB_Request req = {USB_REQ_TYPE_HID, USB_REQ_HID_SET_IDLE, USB_HID_MAKE_IDLE(1L, USB_HID_IDLE_REPORTALL) /*minimal*/, 0, 0};
-        req.wIndex = (uint16_t)kbd->bInterface;
-        USB_SendRequest(pDevice, &req, NULL, USB_HID_DummyCallback, NULL);
-        kbd->Idle = FALSE;
-    }
-    else if(empty && !kbd->Idle) //start idle if no input (no interrupts)
-    {
-        USB_Request req = {USB_REQ_TYPE_HID, USB_REQ_HID_SET_IDLE, USB_HID_MAKE_IDLE(USB_HID_IDLE_INDEFINITE, USB_HID_IDLE_REPORTALL) /*indefinite until input detected, all reports*/, 0, 0};
-        req.wIndex = (uint16_t)kbd->bInterface;
-        USB_SendRequest(pDevice, &req, NULL, USB_HID_DummyCallback, NULL);
-        kbd->Idle = TRUE;
-    }
+    //Gap-K Workaround A (May 2026): the device is configured at install time with SET_IDLE(MINIMAL)
+    //and stays in that state permanently.  The previous code toggled between SET_IDLE(INDEFINITE)
+    //and SET_IDLE(MINIMAL) from this interrupt-context callback via async USB_SendRequest, which
+    //violated EHCI_ControlTransfer's "no pending transfers" assumption and could trip an assertion
+    //(see HID_DOS_Install for full context).  The kbd->Idle field is kept for ABI compatibility but
+    //is no longer read; it stays at the value set during install (FALSE for the minimal-idle config).
 
     USB_HID_Keyboard_SetupLED(pDevice);
     
