@@ -44,6 +44,17 @@
 #define USB_MSC_CSW_STATUS_FAILED       1
 #define USB_MSC_CSW_STATUS_PHASE_ERROR  2
 
+//transfer-level result of USB_MSC_IssueCommand (P1).
+//NOTE: OK==0; callers must test against USB_MSC_XFER_OK explicitly (not !ret),
+//since this enum replaces the old BOOL where TRUE(1)==success.
+typedef enum
+{
+    USB_MSC_XFER_OK = 0,            //CSW good (bCSWStatus==0)
+    USB_MSC_XFER_COMMAND_FAILED,    //bCSWStatus==1; sense left to the caller (E-2)
+    USB_MSC_XFER_PHASE_ERROR,       //bCSWStatus==2; reset-recovery performed
+    USB_MSC_XFER_FAILED,            //transport/protocol failure; reset-recovery performed
+}USB_MSC_XferStatus;
+
 
 //CBW & CSW are transported via data (bulk) transfer. CBW(OUT) -> data(IN/OUT) -> CSW(IN)
 
@@ -145,18 +156,21 @@ static_assert(sizeof(USB_MSC_READ_CMD) == 12, "incorrect size");
 typedef USB_MSC_INQUIRY_CMD USB_MSC_REQSENSE_CMD; //opcode = USB_MSC_SBC_REQSENSE
 typedef struct USB_MSC_ReqSenseData
 {
-    uint8_t ErrorCode : 7; //0x70~0x71
+    uint8_t ErrorCode : 7; //byte0: response code 0x70~0x71 (fixed format)
     uint8_t Valid : 1;
-    uint8_t SenseKey : 4;
+    uint8_t SegmentNumber; //byte1: obsolete/segment. Was MISSING (BUG-01/F-MSC-01),
+                           //which shifted SenseKey/ASC/ASCQ one byte low.
+    uint8_t SenseKey : 4;  //byte2 low nibble
     uint8_t Reserved0 : 1;
-    uint8_t ILI : 1;
+    uint8_t ILI : 1;       //byte2 bit5
     uint8_t Reserved : 2;
-    uint32_t Information;
-    uint8_t AdditionalSenseLength; //n-7
-    uint32_t CommandSpecificInformation;
-    uint8_t AdditionalSenseCode;
-    uint8_t AdditionalSenseCodeQualifierOPT;
+    uint32_t Information;                    //bytes3-6
+    uint8_t AdditionalSenseLength; //n-7      //byte7
+    uint32_t CommandSpecificInformation;     //bytes8-11
+    uint8_t AdditionalSenseCode;             //byte12 (ASC)
+    uint8_t AdditionalSenseCodeQualifierOPT; //byte13 (ASCQ)
 }USB_MSC_REQSENSE_DATA;
+static_assert(sizeof(USB_MSC_REQSENSE_DATA) == 14, "incorrect size");
 
 
 ///TEST UNIT READY
@@ -278,7 +292,7 @@ BOOL USB_MSC_DeinitDevice(USB_Device* pDevice);
 
 BOOL USB_MSC_BulkReset(USB_Device* pDevice);
 
-BOOL USB_MSC_IssueCommand(USB_Device* pDevice, void* inputp cmd, uint32_t CmdSize, uint32_t LinearData, uint32_t DataSize, HCD_TxDir dir);
+USB_MSC_XferStatus USB_MSC_IssueCommand(USB_Device* pDevice, void* inputp cmd, uint32_t CmdSize, uint32_t LinearData, uint32_t DataSize, HCD_TxDir dir, uint32_t* nullable pResidue);
 
 //separate dos installation routine, might be called delayed
 BOOL USB_MSC_DOS_Install();

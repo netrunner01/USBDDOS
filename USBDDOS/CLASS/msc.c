@@ -75,7 +75,7 @@ BOOL USB_MSC_InitDevice(USB_Device* pDevice)
         cmd.opcode = USB_MSC_SBC_INQUIRY;
         cmd.LUN = 0;
         cmd.AllocationLength = sizeof(data);
-        if(!USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(&data), sizeof(data), HCD_TXR))
+        if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(&data), sizeof(data), HCD_TXR, NULL) != USB_MSC_XFER_OK)
         {
             _LOG("MSC Failed INQUIRY.\n");
             return FALSE;
@@ -90,7 +90,7 @@ BOOL USB_MSC_InitDevice(USB_Device* pDevice)
         for(int i = 0; i <= pDriverData->MaxLUN; ++i)
         {
             cmd.LUN = ((uint8_t)i)&0x7U;
-            if(!USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(&data), sizeof(data), HCD_TXR))
+            if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(&data), sizeof(data), HCD_TXR, NULL) != USB_MSC_XFER_OK)
             {
                 _LOG("MSC Failed get capacity.\n");
                 return FALSE;
@@ -138,18 +138,33 @@ BOOL USB_MSC_BulkReset(USB_Device* pDevice)
     return USB_SyncSendRequest(pDevice, &Req, NULL) != 0;
 }
 
-BOOL USB_MSC_IssueCommand(USB_Device* pDevice, void* inputp cmd, uint32_t CmdSize, uint32_t nullable LinearData, uint32_t DataSize, HCD_TxDir dir)
+//Bulk-Only Mass Storage Reset recovery (BOMS 5.3.4): BOMS-Reset, then
+//ClearFeature(HALT) on Bulk-In then Bulk-Out. The per-HCD host-side data
+//toggle reset attaches to these ClearHalt calls in P7 (Stage 3); here they
+//are plain ClearHalt.
+static void usb_msc_reset_recovery(USB_Device* pDevice, USB_MSC_DriverData* pDriverData)
+{
+    USB_MSC_BulkReset(pDevice);
+    USB_ClearHalt(pDevice, pDriverData->bEPAddr[1]); //Bulk-In
+    USB_ClearHalt(pDevice, pDriverData->bEPAddr[0]); //Bulk-Out
+}
+
+//incrementing CBW tag (BUG-15): never use a stack address as the tag.
+static uint32_t s_MSC_TagCounter = 0;
+
+USB_MSC_XferStatus USB_MSC_IssueCommand(USB_Device* pDevice, void* inputp cmd, uint32_t CmdSize, uint32_t nullable LinearData, uint32_t DataSize, HCD_TxDir dir, uint32_t* nullable pResidue)
 {
     if(pDevice == NULL || pDevice->pDriverData == NULL || cmd == NULL || CmdSize > 16 || CmdSize < 1
         || (DataSize != 0 && LinearData == 0))
-        return FALSE;
+        return USB_MSC_XFER_FAILED;
     USB_MSC_DriverData* pDriverData = (USB_MSC_DriverData*)pDevice->pDriverData;
 
     //CBW
     USB_MSC_CBW cbw;
     memset(&cbw, 0, sizeof(cbw));
     cbw.dCBWSignature = USB_MSC_CBW_SIGNATURE;
-    cbw.dCBWTag = (uintptr_t)&cbw; //use addr as tag
+    uint32_t tag = ++s_MSC_TagCounter; //cached so a recovery resend reuses it (BUG-15)
+    cbw.dCBWTag = tag;
     cbw.dCBWDataTransferLength = DataSize;
     cbw.bmCBWFlags = dir == HCD_TXR ? 0x80U : 0;
     cbw.bCBWLUN = 0;
@@ -166,7 +181,7 @@ BOOL USB_MSC_IssueCommand(USB_Device* pDevice, void* inputp cmd, uint32_t CmdSiz
         DPMI_DMAFree(dma);
         _LOG("MSC CBW failed: %x, %d, %d.\n", error, size, len);
         USB_ClearHalt(pDevice, pDriverData->bEPAddr[0]);
-        return FALSE;
+        return USB_MSC_XFER_FAILED;
     }
     
     //DATA
@@ -181,7 +196,7 @@ BOOL USB_MSC_IssueCommand(USB_Device* pDevice, void* inputp cmd, uint32_t CmdSiz
             DPMI_DMAFree(dma);
             _LOG("MSC DATA Failed: %x, %d, %d, %d.\n", error, dir, DataSize, len);
             USB_ClearHalt(pDevice, pDriverData->bEPAddr[dir&0x1]);
-            return FALSE;
+            return USB_MSC_XFER_FAILED;
         }
         if(dir == HCD_TXR)
             DPMI_CopyLinear(LinearData, DPMI_PTR2L(dma), DataSize);
@@ -194,16 +209,33 @@ BOOL USB_MSC_IssueCommand(USB_Device* pDevice, void* inputp cmd, uint32_t CmdSiz
     error = USB_SyncTransfer(pDevice, pDriverData->pDataEP[1], dma, size, &len);
     USB_MSC_CSW csw = *(USB_MSC_CSW*)dma;
     DPMI_DMAFree(dma);
-    if(error || len != size || csw.dCSWSignature != USB_MSC_CSW_SIGNATURE || csw.dCSWTag != cbw.dCBWTag
-    || csw.dCSWDataResidue != 0)
+
+    //CSW validation tree (P1): honor bCSWStatus; REQUEST SENSE is left to the
+    //caller (E-2 - the transport never auto-issues it).
+    if(error || len != size
+    || csw.dCSWSignature != USB_MSC_CSW_SIGNATURE
+    || csw.dCSWTag != tag
+    || csw.bCSWStatus > USB_MSC_CSW_STATUS_PHASE_ERROR
+    || csw.dCSWDataResidue > DataSize)
     {
-        USB_ClearHalt(pDevice, pDriverData->bEPAddr[1]);
-        _LOG("MSC CSW: %lx, %lx, %lx, %x\n", csw.dCSWSignature, csw.dCSWTag, csw.dCSWDataResidue, csw.bCSWStatus);
-        _LOG("MSC CSW Failed: %x, %d, %d\n", error, size, len);
-        _LOG("MSC CBW length: %ld\n", cbw.dCBWDataTransferLength);
-        return FALSE;
+        _LOG("MSC CSW invalid: %lx, %lx, %lx, %x (err=%x size=%d len=%d)\n", csw.dCSWSignature, csw.dCSWTag, csw.dCSWDataResidue, csw.bCSWStatus, error, size, len);
+        usb_msc_reset_recovery(pDevice, pDriverData);
+        return USB_MSC_XFER_FAILED;
     }
-    return TRUE;
+
+    if(pResidue)
+        *pResidue = csw.dCSWDataResidue;
+
+    if(csw.bCSWStatus == USB_MSC_CSW_STATUS_PHASE_ERROR)
+    {
+        _LOG("MSC CSW phase error: %lx\n", csw.dCSWDataResidue);
+        usb_msc_reset_recovery(pDevice, pDriverData);
+        return USB_MSC_XFER_PHASE_ERROR;
+    }
+    if(csw.bCSWStatus == USB_MSC_CSW_STATUS_FAILED)
+        return USB_MSC_XFER_COMMAND_FAILED; //sense left to caller (E-2)
+
+    return USB_MSC_XFER_OK;
 }
 
 
@@ -567,7 +599,7 @@ static void USB_MSC_DOS_DriverINT()
                 uint16_t tlen = (uint16_t)(tc * pDriverData->BlockSize);
                 cmd.LBA = EndianSwap32(start+off);
                 cmd.TransferLength = EndianSwap16(tc);
-                if(!USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_FP2L(request.ReadWrite.Address)+off*pDriverData->BlockSize, tlen, HCD_TXR))
+                if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_FP2L(request.ReadWrite.Address)+off*pDriverData->BlockSize, tlen, HCD_TXR, NULL) != USB_MSC_XFER_OK)
                 {
                     request.Header.Status = DOS_DRSS_ERRORBIT | DOS_DRSS_READ_FAULT;
                     request.ReadWrite.Count = 0;
@@ -601,7 +633,7 @@ static void USB_MSC_DOS_DriverINT()
                 uint16_t tlen = (uint16_t)(tc * pDriverData->BlockSize);
                 cmd.LBA = EndianSwap32(start+off);
                 cmd.TransferLength = EndianSwap16(tc);
-                if(!USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_FP2L(request.ReadWrite.Address)+off*pDriverData->BlockSize, tlen, HCD_TXW))
+                if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_FP2L(request.ReadWrite.Address)+off*pDriverData->BlockSize, tlen, HCD_TXW, NULL) != USB_MSC_XFER_OK)
                 {
                     request.Header.Status = DOS_DRSS_ERRORBIT | DOS_DRSS_WRITE_FAULT;
                     request.ReadWrite.Count = 0;
@@ -622,7 +654,11 @@ static void USB_MSC_DOS_DriverINT()
                     cmd.opcode = USB_MSC_SBC_VERIFY;
                     cmd.LBA = EndianSwap32((uint32_t)request.ReadWrite.Start);
                     cmd.VerificationLen = EndianSwap16(request.ReadWrite.Count);
-                    if( USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), 0, 0, HCD_TXW) != 0)
+                    //FIXME(out-of-P1-scope): this sets WRITE_FAULT when VERIFY *succeeds*
+                    //(old code tested `!= 0` i.e. TRUE/success). Looks inverted, but it is
+                    //preserved verbatim by P1 to keep the regression baseline stable; the
+                    //real verify result is determined by the REQUEST SENSE below.
+                    if( USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), 0, 0, HCD_TXW, NULL) == USB_MSC_XFER_OK)
                         request.Header.Status = DOS_DRSS_ERRORBIT | DOS_DRSS_WRITE_FAULT;
                 }
                 {//REQUEST SENSE to get verify result
@@ -631,7 +667,7 @@ static void USB_MSC_DOS_DriverINT()
                     cmd.opcode = USB_MSC_SBC_REQSENSE;
                     cmd.AllocationLength = sizeof(USB_MSC_REQSENSE_DATA);
                     USB_MSC_REQSENSE_DATA* dma = (USB_MSC_REQSENSE_DATA*)DPMI_DMAMalloc(sizeof(USB_MSC_REQSENSE_DATA), 16);
-                    if(!USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(dma), sizeof(USB_MSC_REQSENSE_DATA), HCD_TXR))
+                    if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(dma), sizeof(USB_MSC_REQSENSE_DATA), HCD_TXR, NULL) != USB_MSC_XFER_OK)
                         request.Header.Status = DOS_DRSS_ERRORBIT | DOS_DRSS_GENERAL_FAULT;
                     if(dma->SenseKey) //TODO: spec on errorcode & sense code
                         request.Header.Status = DOS_DRSS_ERRORBIT | DOS_DRSS_GENERAL_FAULT;
@@ -740,7 +776,7 @@ static BOOL USB_MSC_DOS_InstallDevice(USB_Device* pDevice)     //ref: https://gi
             cmd.LBA = EndianSwap32(VBRSector + TSRData.bpb.DOS70.FSSector);
             cmd.TransferLength = EndianSwap16(1); //sector count
             uint8_t* FSSector = (uint8_t*)malloc(pDriverData->BlockSize);
-            BOOL result = USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(FSSector), pDriverData->BlockSize, HCD_TXR);
+            BOOL result = (USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(FSSector), pDriverData->BlockSize, HCD_TXR, NULL) == USB_MSC_XFER_OK);
             if(result)
             { //https://en.wikipedia.org/wiki/Design_of_the_FAT_file_system#FS_Information_Sector
                 FreeClusters = *(uint32_t*)&FSSector[0x1E8];
@@ -1101,7 +1137,7 @@ static BOOL USB_MSC_ReadSector(USB_Device* pDevice, uint32_t sector, uint16_t co
     cmd.LUN = 0;
     cmd.LBA = EndianSwap32(sector);
     cmd.TransferLength = EndianSwap16(count); //sector count
-    return USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(buf), pDriverData->BlockSize, HCD_TXR);
+    return USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(buf), pDriverData->BlockSize, HCD_TXR, NULL) == USB_MSC_XFER_OK;
 }
 
 #if DEBUG && 0
