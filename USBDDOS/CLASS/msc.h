@@ -104,6 +104,18 @@ typedef struct USB_MSC_CommandStatusWrapper
 #define USB_MSC_SBC_VERIFY          0x2F
 #define USB_MSC_SBC_WRITE10         0x2A
 
+//SCSI sense keys (fixed-format sense, byte2 low nibble) - P3 readiness handshake
+#define USB_MSC_SK_NOT_READY            0x02
+#define USB_MSC_SK_UNIT_ATTENTION       0x06
+//additional sense codes (ASC, byte12)
+#define USB_MSC_ASC_NOT_RDY_TO_RDY      0x28 //not-ready-to-ready / medium may have changed (UA)
+#define USB_MSC_ASC_POWERON_RESET       0x29 //power-on / reset / bus-device-reset (UA)
+#define USB_MSC_ASC_LU_NOT_READY        0x04 //logical unit not ready (ASCQ 0x01 = becoming ready)
+#define USB_MSC_ASC_MEDIUM_NOT_PRESENT  0x3A
+//readiness handshake budget (E-4a). USB hard drives may need longer; this is the knob.
+#define USBDDOS_MSC_TUR_TIMEOUT_MS      5000
+#define USBDDOS_MSC_TUR_RETRY_MS        100
+
 ///INQUIRY
 //Peripheral Device Type for INQUIRY
 #define USB_MSC_PDT_SBC_DAD         0x00 //SBC Direct-access device

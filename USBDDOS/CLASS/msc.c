@@ -9,6 +9,96 @@
 
 static BOOL USB_MSC_ReadSector(USB_Device* pDevice, uint32_t sector, uint16_t count, void* buf, size_t size);
 
+//parsed REQUEST SENSE result (E-2: the command wrapper issues sense, not the transport)
+typedef struct
+{
+    uint8_t key;
+    uint8_t asc;
+    uint8_t ascq;
+    BOOL valid;
+}MSC_SenseInfo;
+
+//issue REQUEST SENSE via the P1 transport and return the (now correctly parsed) key/ASC/ASCQ.
+static MSC_SenseInfo MSC_RequestSense(USB_Device* pDevice)
+{
+    MSC_SenseInfo s = {0,0,0,FALSE};
+    USB_MSC_REQSENSE_CMD cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = USB_MSC_SBC_REQSENSE;
+    cmd.AllocationLength = sizeof(USB_MSC_REQSENSE_DATA);
+    USB_MSC_REQSENSE_DATA* dma = (USB_MSC_REQSENSE_DATA*)DPMI_DMAMalloc(sizeof(USB_MSC_REQSENSE_DATA), 16);
+    if(dma == NULL)
+        return s;
+    if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(dma), sizeof(USB_MSC_REQSENSE_DATA), HCD_TXR, NULL) == USB_MSC_XFER_OK)
+    {
+        s.key = (uint8_t)dma->SenseKey;
+        s.asc = dma->AdditionalSenseCode;
+        s.ascq = dma->AdditionalSenseCodeQualifierOPT;
+        s.valid = TRUE;
+    }
+    DPMI_DMAFree(dma);
+    return s;
+}
+
+//Readiness handshake (P3): consume the power-on UNIT ATTENTION and wait for a
+//becoming-ready unit before INQUIRY. Best-effort - never aborts enumeration
+//(attach-anyway); medium-not-present returns promptly without burning the budget.
+//Bounded by USBDDOS_MSC_TUR_TIMEOUT_MS via a delay()-counted loop (codebase idiom;
+//no tick source exists). The whole loop (UA included) is budget-bounded to avoid
+//a UA-storm spinning forever.
+static void MSC_WaitReady(USB_Device* pDevice)
+{
+    USB_MSC_TESTUNITREADY_CMD tur;
+    memset(&tur, 0, sizeof(tur));
+    tur.opcode = USB_MSC_SBC_TESTUNITREADY;
+
+    int budget = USBDDOS_MSC_TUR_TIMEOUT_MS;
+    for(;;)
+    {
+        USB_MSC_XferStatus st = USB_MSC_IssueCommand(pDevice, &tur, sizeof(tur), 0, 0, HCD_TXW, NULL);
+        if(st == USB_MSC_XFER_OK)
+            return; //ready (silent on the success path to minimize log churn)
+        if(st != USB_MSC_XFER_COMMAND_FAILED)
+        {
+            _LOG("MSC WaitReady: transport status %d, proceeding.\n", st);
+            return; //FAILED/PHASE_ERROR (reset already done) - let INQUIRY decide
+        }
+
+        MSC_SenseInfo s = MSC_RequestSense(pDevice);
+        if(!s.valid)
+        {
+            _LOG("MSC WaitReady: sense unavailable, proceeding.\n");
+            return;
+        }
+        if(s.key == USB_MSC_SK_UNIT_ATTENTION)
+        {
+            _LOG("MSC WaitReady: UA (asc %x), retry.\n", s.asc); //consume, retry
+        }
+        else if(s.key == USB_MSC_SK_NOT_READY && s.asc == USB_MSC_ASC_MEDIUM_NOT_PRESENT)
+        {
+            _LOG("MSC WaitReady: no media.\n");
+            return; //attach-anyway: report promptly, do not burn the budget
+        }
+        else if(s.key == USB_MSC_SK_NOT_READY && s.asc == USB_MSC_ASC_LU_NOT_READY)
+        {
+            _LOG("MSC WaitReady: becoming ready, wait.\n"); //sleep + retry below
+        }
+        else
+        {
+            _LOG("MSC WaitReady: sense key %x asc %x, proceeding.\n", s.key, s.asc);
+            return; //else - hard, proceed (attach-anyway)
+        }
+
+        if(budget <= 0)
+        {
+            _LOG("MSC WaitReady: timeout.\n");
+            return;
+        }
+        delay(USBDDOS_MSC_TUR_RETRY_MS);
+        budget -= USBDDOS_MSC_TUR_RETRY_MS;
+    }
+}
+
 BOOL USB_MSC_InitDevice(USB_Device* pDevice)
 {
     assert(pDevice->bStatus == DS_Configured);
@@ -66,6 +156,10 @@ BOOL USB_MSC_InitDevice(USB_Device* pDevice)
 
     USB_ClearHalt(pDevice, pDriverData->bEPAddr[0]);
     USB_ClearHalt(pDevice, pDriverData->bEPAddr[1]);
+
+    //P3: consume power-on UNIT ATTENTION and wait for readiness before INQUIRY
+    //(C-1). Best-effort/attach-anyway - never aborts enumeration.
+    MSC_WaitReady(pDevice);
 
     //perform other readings as sanity check
     {
@@ -599,8 +693,16 @@ static void USB_MSC_DOS_DriverINT()
                 uint16_t tlen = (uint16_t)(tc * pDriverData->BlockSize);
                 cmd.LBA = EndianSwap32(start+off);
                 cmd.TransferLength = EndianSwap16(tc);
-                if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_FP2L(request.ReadWrite.Address)+off*pDriverData->BlockSize, tlen, HCD_TXR, NULL) != USB_MSC_XFER_OK)
+                USB_MSC_XferStatus rdst = USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_FP2L(request.ReadWrite.Address)+off*pDriverData->BlockSize, tlen, HCD_TXR, NULL);
+                if(rdst != USB_MSC_XFER_OK)
                 {
+#if DEBUG
+                    if(rdst == USB_MSC_XFER_COMMAND_FAILED)
+                    {
+                        MSC_SenseInfo s = MSC_RequestSense(pDevice); //E-2: diagnostics only, no retry
+                        _LOG("MSC READ failed: key %x asc %x ascq %x\n", s.key, s.asc, s.ascq);
+                    }
+#endif
                     request.Header.Status = DOS_DRSS_ERRORBIT | DOS_DRSS_READ_FAULT;
                     request.ReadWrite.Count = 0;
                     break;
@@ -633,8 +735,16 @@ static void USB_MSC_DOS_DriverINT()
                 uint16_t tlen = (uint16_t)(tc * pDriverData->BlockSize);
                 cmd.LBA = EndianSwap32(start+off);
                 cmd.TransferLength = EndianSwap16(tc);
-                if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_FP2L(request.ReadWrite.Address)+off*pDriverData->BlockSize, tlen, HCD_TXW, NULL) != USB_MSC_XFER_OK)
+                USB_MSC_XferStatus wrst = USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_FP2L(request.ReadWrite.Address)+off*pDriverData->BlockSize, tlen, HCD_TXW, NULL);
+                if(wrst != USB_MSC_XFER_OK)
                 {
+#if DEBUG
+                    if(wrst == USB_MSC_XFER_COMMAND_FAILED)
+                    {
+                        MSC_SenseInfo s = MSC_RequestSense(pDevice); //E-2: diagnostics only, no retry
+                        _LOG("MSC WRITE failed: key %x asc %x ascq %x\n", s.key, s.asc, s.ascq);
+                    }
+#endif
                     request.Header.Status = DOS_DRSS_ERRORBIT | DOS_DRSS_WRITE_FAULT;
                     request.ReadWrite.Count = 0;
                     break;
