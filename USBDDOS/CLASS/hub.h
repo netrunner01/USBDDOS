@@ -3,7 +3,7 @@
 #include "USBDDOS/usb.h"
 
 #define USB_REQ_TYPE_HUB      (USB_REQTYPE_CLASS)
-#define USB_REQ_TYPE_HUBPORT  (USB_REQTYPE_CLASS |  USB_REQREC_ENDPOINT | USB_REQREC_INTERFACE)
+#define USB_REQ_TYPE_HUBPORT  (USB_REQTYPE_CLASS | USB_REQREC_OTHER) //BUG-13: recipient OTHER(3). Was ENDPOINT(2)|INTERFACE(1), which equals 3 only by arithmetic accident; bmRequestType byte unchanged (0x23).
 #define USB_DT_HUB 0x29
 
 typedef struct USB_HubDescriptor
