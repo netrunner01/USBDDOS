@@ -87,6 +87,11 @@ static BOOL HUB_SetPortStatus(HCD_HUB* pHub, uint8_t port, uint16_t status)
         result = USB_HUB_ClearPortFeature(HC2USB(pHub->pDevice), port, C_PORT_RESET) && result;
 
         _LOG("HUB port %d reset %x\n", port, current);
+        //BUG-07: reset-recovery (TRSTRCY). USB 2.0 9.2.6.2/7.1.7.5 require >=10ms before
+        //addressing the device after reset; matches UHCI (uhci.c:531)/EHCI (ehci.c:440)
+        //delay(15). Task context. In the reset block so a future Q-006 connect-debounce
+        //(CONNECT_CHANGE block) stays additive, not duplicated.
+        delay(15);
     }
 
     if((status&USB_PORT_ENABLE) && !(current&PS_ENABLE))

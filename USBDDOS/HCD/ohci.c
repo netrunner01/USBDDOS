@@ -741,6 +741,11 @@ BOOL OHCI_SetPortStatus(HCD_Interface* pHCI, uint8_t port, uint16_t status)
         DPMI_StoreD(dwPortAddr, PortResetStatusChange);
         cur &= ~PortEnableStatus;
         _LOG("OHCI port reset done.\n");
+        //BUG-08: reset-recovery (TRSTRCY). USB 2.0 9.2.6.2/7.1.7.5 require >=10ms before
+        //addressing the device after reset; UHCI (uhci.c:531)/EHCI (ehci.c:440) already
+        //do delay(15) here, OHCI was missing it. Reached only via HUB_SetPortStatus from
+        //enumeration/task context (never the ISR), so delay() is safe.
+        delay(15);
     }
 
     if((status & USB_PORT_ENABLE) && !(cur & PortEnableStatus))
