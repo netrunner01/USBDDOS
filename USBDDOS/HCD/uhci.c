@@ -835,7 +835,15 @@ void UHCI_StopHC(HCD_Interface* pHCI)
 {
     uint16_t cmd = inpw((uint16_t)(pHCI->dwBaseAddress + USBCMD));
     outpw((uint16_t)(pHCI->dwBaseAddress + USBCMD), (uint16_t)(cmd&~RS));
-    delay(10);
+    //BUG-11: after clearing Run/Stop the HC finishes the current transaction and
+    //then sets HCHalted (UHCI 1.1 2.1.1); poll for it (bounded ~10ms) before
+    //returning, so the caller can't free structures the controller may still be
+    //reading. The HC halts within ~1 frame; the old blind delay(10) was a guess.
+    int timeout = 10;
+    while(!(inpw((uint16_t)(pHCI->dwBaseAddress + USBSTS)) & USBHCHALTED) && --timeout > 0)
+        delay(1);
+    if(timeout == 0)
+        _LOG("UHCI: HC did not halt within ~10ms after Run/Stop cleared\n");
     return;
 }
 
