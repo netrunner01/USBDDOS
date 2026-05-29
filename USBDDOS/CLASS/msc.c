@@ -166,14 +166,30 @@ BOOL USB_MSC_InitDevice(USB_Device* pDevice)
         USB_MSC_INQUIRY_CMD cmd;
         USB_MSC_INQUIRY_DATA data;
         memset(&cmd, 0, sizeof(cmd));
+        memset(&data, 0, sizeof(data));   //P11/F-SCSI-07: zero-init so a short INQUIRY
+                                          //leaves zeros, not stack garbage (cf. Linux
+                                          //scsi_probe_lun: 0-fill, then use >=36B).
         cmd.opcode = USB_MSC_SBC_INQUIRY;
         cmd.LUN = 0;
         cmd.AllocationLength = sizeof(data);
-        if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(&data), sizeof(data), HCD_TXR, NULL) != USB_MSC_XFER_OK)
+        uint32_t residue = 0;
+        if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(&data), sizeof(data), HCD_TXR, &residue) != USB_MSC_XFER_OK)
         {
             _LOG("MSC Failed INQUIRY.\n");
             return FALSE;
         }
+        //P11/F-SCSI-07: transfer length (sizeof - residue) bounds which fields
+        //physically arrived; the rest are zero. AdditionalLength (byte 4, =n-4) is a
+        //diagnostic only, NOT a gate on the vendor strings: many devices understate it
+        //while returning valid Vendor/Product/Revision (Linux scsi_scan uses >=36B
+        //regardless). A future quirk match (P2 bIgnoreResidue) must verify the field's
+        //bytes were transferred, not trust AdditionalLength.
+#if DEBUG
+        if(residue != 0)
+            _LOG("MSC short INQUIRY: %lu/%u bytes, AddlLen %u\n",
+                 (unsigned long)(sizeof(data) - residue), (unsigned)sizeof(data),
+                 (unsigned)data.AdditionalLength);
+#endif
         _LOG("PDT: %x\n", data.PDT);
     }
     {
