@@ -644,6 +644,14 @@ BOOL USB_SetConfiguration(USB_Device* pDevice, uint8_t configuration)
 BOOL USB_ParseConfiguration(uint8_t* pBuffer, uint16_t length, USB_Device* pDevice)
 {
     assert(((USB_ConfigDesc*)pBuffer)->wTotalLength == length);
+    //BUG-12: bound bNumConfigurations before allocating, so a pathological device
+    //descriptor can't drive a large alloc on tight XMS. Analogous to the
+    //bNumInterfaces>32 cap (Gap I(c)); real devices have 1-2 configurations.
+    if(pDevice->Desc.bNumConfigurations > 8)
+    {
+        _LOG("USB: device claims %d configurations; capping at 8\n", pDevice->Desc.bNumConfigurations);
+        pDevice->Desc.bNumConfigurations = 8;
+    }
     pDevice->pConfigList = (USB_ConfigDesc*)malloc(sizeof(USB_ConfigDesc)*pDevice->Desc.bNumConfigurations);
     assert(pDevice->pConfigList);
     memset(pDevice->pConfigList, 0, sizeof(USB_ConfigDesc)*pDevice->Desc.bNumConfigurations);
@@ -655,6 +663,13 @@ BOOL USB_ParseConfiguration(uint8_t* pBuffer, uint16_t length, USB_Device* pDevi
     uint16_t i = 0;
     while(i < length)
     {
+        //BUG-03: the 2-byte header (bLength,bDescriptorType) must be readable
+        //before we dereference pBuffer[i+1]  (libusb: "if (len < 2)").
+        if (i + 2 > length)
+        {
+            _LOG("USB: truncated descriptor header at offset %d; bailing parse\n", i);
+            break;
+        }
         uint8_t len = *(pBuffer + i);
         uint8_t descType = *(pBuffer + (i+1));
         //Gap I (d): defend against malformed/zero-length descriptors that would cause
@@ -665,16 +680,33 @@ BOOL USB_ParseConfiguration(uint8_t* pBuffer, uint16_t length, USB_Device* pDevi
             _LOG("USB: malformed descriptor at offset %d (bLength=0, type=%02x); bailing parse\n", i, descType);
             break;
         }
+        //BUG-03: a descriptor must not claim to run past the buffer (Microsoft
+        //USBD_ValidateConfigurationDescriptor "Level 2"); if it does, the
+        //remainder is untrustworthy -> bail.
+        if (i + len > length)
+        {
+            _LOG("USB: descriptor at %d claims len %d past buffer end %d; bailing parse\n", i, len, length);
+            break;
+        }
         if(descType == USB_DT_CONFIGURATION)
         {
+            if(len < 9) //BUG-03: USB_DT_CONFIG_SIZE; don't read a short desc as a full config
+            { _LOG("USB: short config desc (len=%d) at %d; skipping\n", len, i); i = (uint16_t)(i + len); continue; }
             ++ConfigIndex;
-            assert(ConfigIndex < pDevice->Desc.bNumConfigurations);
+            //BUG-03: was assert-only (RELEASE no-op -> out-of-bounds write into
+            //pConfigList if the device sends more config descriptors than declared).
+            if(ConfigIndex >= pDevice->Desc.bNumConfigurations)
+            {
+                _LOG("USB: more config descriptors than declared (%d); bailing parse\n", pDevice->Desc.bNumConfigurations);
+                break;
+            }
             //reset sub indices
             InterfaceIndex = -1;
             EndpointIndex = -1;
 
-            USB_ConfigDesc* pConfigDesc = (USB_ConfigDesc*)(pBuffer + i);
-            pDevice->pConfigList[ConfigIndex] = *pConfigDesc;
+            //BUG-03: copy only the 9 wire bytes (slot is pre-zeroed; pInterfaces set
+            //below). Avoids the sizeof() tail over-read past a tight DMA buffer.
+            memcpy(&pDevice->pConfigList[ConfigIndex], pBuffer + i, 9);
             //Gap I (c): cap bNumInterfaces per Linux USB_QUIRK_HONOR_BNUMINTERFACES.
             //Some devices advertise more interface descriptors than they can service
             //and cannot handle iteration past the declared count, or report
@@ -691,6 +723,10 @@ BOOL USB_ParseConfiguration(uint8_t* pBuffer, uint16_t length, USB_Device* pDevi
         }
         else if(descType == USB_DT_INTERFACE)
         {
+            if(len < 9) //BUG-03: USB_DT_INTERFACE_SIZE
+            { _LOG("USB: short interface desc (len=%d) at %d; skipping\n", len, i); i = (uint16_t)(i + len); continue; }
+            if(ConfigIndex < 0) //BUG-03: interface before any config -> pConfigList[-1]
+            { _LOG("USB: interface descriptor before any config at %d; skipping\n", i); i = (uint16_t)(i + len); continue; }
             ++InterfaceIndex;
             EndpointIndex = -1;
             //assert(InterfaceIndex < pDevice->pConfigList[ConfigIndex].bNumInterfaces); //why would it happen? - vendor specific descriptors, ignore
@@ -701,8 +737,9 @@ BOOL USB_ParseConfiguration(uint8_t* pBuffer, uint16_t length, USB_Device* pDevi
                 break;
             }
 
-            USB_InterfaceDesc *pInterfaceDesc = (USB_InterfaceDesc*)(pBuffer + i);
-            pDevice->pConfigList[ConfigIndex].pInterfaces[InterfaceIndex] = *(USB_InterfaceDesc*)(pBuffer + i);
+            //BUG-03: copy only the 9 wire bytes (pEndpoints/offset set below).
+            memcpy(&pDevice->pConfigList[ConfigIndex].pInterfaces[InterfaceIndex], pBuffer + i, 9);
+            USB_InterfaceDesc *pInterfaceDesc = &pDevice->pConfigList[ConfigIndex].pInterfaces[InterfaceIndex];
             if (pDevice->Desc.bDeviceClass == 0)
             {
                 pDevice->Desc.bDeviceClass = pInterfaceDesc->bInterfaceClass;
@@ -720,9 +757,20 @@ BOOL USB_ParseConfiguration(uint8_t* pBuffer, uint16_t length, USB_Device* pDevi
         }
         else if(descType == USB_DT_ENDPOINT)
         {
+            if(len < 7) //BUG-03: USB_DT_ENDPOINT_SIZE
+            { _LOG("USB: short endpoint desc (len=%d) at %d; skipping\n", len, i); i = (uint16_t)(i + len); continue; }
+            if(ConfigIndex < 0 || InterfaceIndex < 0) //BUG-03: endpoint with no interface context
+            { _LOG("USB: endpoint descriptor with no interface at %d; skipping\n", i); i = (uint16_t)(i + len); continue; }
             ++EndpointIndex;
-            assert(EndpointIndex < pDevice->pConfigList[ConfigIndex].pInterfaces[InterfaceIndex].bNumEndpoints);
-            pDevice->pConfigList[ConfigIndex].pInterfaces[InterfaceIndex].pEndpoints[EndpointIndex] = *(USB_EndpointDesc*)(pBuffer+i);
+            //BUG-03: was assert-only (RELEASE no-op -> out-of-bounds write into
+            //pEndpoints if the device sends more endpoints than the interface declared).
+            if(EndpointIndex >= pDevice->pConfigList[ConfigIndex].pInterfaces[InterfaceIndex].bNumEndpoints)
+            {
+                _LOG("USB: more endpoints than declared for interface %d; skipping extra\n", InterfaceIndex);
+                i = (uint16_t)(i + len);
+                continue;
+            }
+            memcpy(&pDevice->pConfigList[ConfigIndex].pInterfaces[InterfaceIndex].pEndpoints[EndpointIndex], pBuffer + i, 7); //wire only
         }
         else if(descType == USB_DT_INTERFACE_ASSOCIATION)
         {
