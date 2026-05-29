@@ -35,6 +35,7 @@ static BOOL EHCI_InitDevice(HCD_Device* pDevice);
 static BOOL EHCI_RemoveDevice(HCD_Device* pDevice);
 static void* EHCI_CreateEndpoint(HCD_Device* pDevice, uint8_t EPAddr, HCD_TxDir dir, uint8_t bTransferType, uint16_t MaxPacketSize, uint8_t bInterval);
 static BOOL EHCI_RemoveEndpoint(HCD_Device* pDevice, void* pEndpoint);
+static BOOL EHCI_ResetEndpointToggle(HCD_Device* pDevice, void* pEndpoint);
 
 HCD_Method EHCI_AccessMethod =
 {
@@ -48,7 +49,7 @@ HCD_Method EHCI_AccessMethod =
     &EHCI_RemoveDevice,
     &EHCI_CreateEndpoint,
     &EHCI_RemoveEndpoint,
-    NULL, //P7b: EHCI host-toggle reset deferred (needs IAA doorbell; batched with P8)
+    &EHCI_ResetEndpointToggle, //P7b: EHCI host-toggle reset (IAA doorbell + overlay clear)
 };
 
 static void EHCI_ResetHC(HCD_Interface* pHCI);
@@ -587,6 +588,59 @@ void* EHCI_CreateEndpoint(HCD_Device* pDevice, uint8_t EPAddr, HCD_TxDir dir, ui
     return EHCI_EP_MAKE(pQH, EPAddr);
 }
 
+//P8/P7b: ring the EHCI Interrupt-on-Async-Advance doorbell and wait (bounded) for
+//the controller to acknowledge it has advanced through the async schedule and
+//released any cached reference to async QHs (EHCI 1.0 4.8.2). Best-effort: the IAA
+//interrupt is HW-flaky (u-boot bounds it to 10ms and aborts; QEMU/Windows/Linux
+//all time out on it), so a FALSE return means "could not confirm" and callers must
+//degrade safely, never hang. Polls USBSTS (set by HW regardless of the IRQ enable).
+static BOOL EHCI_AsyncAdvanceDoorbell(EHCI_HCData* pHCData)
+{
+    uint32_t sts = DPMI_LoadD(pHCData->OPBase+USBSTS);
+    if((sts & HCHalted) || !(sts & AsyncScheduleSts)) //HC stopped / async off: no DMA in flight, nothing to flush
+        return FALSE;
+    DPMI_StoreD(pHCData->OPBase+USBSTS, INTonAsyncAdvance); //clear stale IAA status (RWC)
+    DPMI_StoreD(pHCData->OPBase+USBCMD, DPMI_LoadD(pHCData->OPBase+USBCMD) | INTonAsyncAdvanceDoorbell); //ring
+    int timeout = 10; //~10ms (u-boot ehci_iaa_cycle model)
+    do
+    {
+        if(DPMI_LoadD(pHCData->OPBase+USBSTS) & INTonAsyncAdvance)
+        {
+            DPMI_StoreD(pHCData->OPBase+USBSTS, INTonAsyncAdvance); //ack (RWC)
+            return TRUE;
+        }
+        delay(1);
+    } while(--timeout > 0);
+    _LOG("EHCI: IAA doorbell timeout (HW flaky); proceeding best-effort\n");
+    return FALSE;
+}
+
+//P7b/BUG-02 (H-1): reset the host-side data toggle after ClearHalt. Bulk QHs use
+//DTC=0, so the toggle lives in the QH overlay and the HC carries it across
+//transfers; the re-arm path never resets it. Only the post-STALL path needs this:
+//a QH that never transferred has overlay toggle already 0 (EHCI 1.0 4.10.2) and
+//cannot be halted (E-3), so we skip unless Halted. The QH is HALTED (Active=0) so
+//the HC is not executing it; the doorbell flushes any cached overlay state and the
+//in-place toggle write then persists until the next transfer re-arms the QH (the
+//HC reloads the overlay from memory). Best-effort/fail-safe: on doorbell timeout
+//we still clear it (safe because the QH is halted), degrading to current behavior
+//at worst. (Linux unlinks+relinks instead; USBDDOS QHs are static and this targets
+//a single halted-QH toggle bit, so the minimal in-place write is preferred.)
+static BOOL EHCI_ResetEndpointToggle(HCD_Device* pDevice, void* pEndpoint)
+{
+    EHCI_QH* pQH = EHCI_EP_GETQH(pEndpoint);
+    if(pDevice == NULL || pQH == NULL)
+        return FALSE;
+    if(!pQH->Token.StatusBm.Halted) //E-3: never-run/proactive QH -> overlay already 0, nothing to reset
+        return FALSE;
+    EHCI_HCData* pHCData = (EHCI_HCData*)pDevice->pHCI->pHCDData;
+    if(pHCData == NULL)
+        return FALSE;
+    EHCI_AsyncAdvanceDoorbell(pHCData);
+    pQH->Token.DataToggle = 0;
+    return TRUE;
+}
+
 BOOL EHCI_RemoveEndpoint(HCD_Device* pDevice, void* pEndpoint)
 {
     EHCI_QH* pQH = EHCI_EP_GETQH(pEndpoint);
@@ -617,6 +671,17 @@ BOOL EHCI_RemoveEndpoint(HCD_Device* pDevice, void* pEndpoint)
         EHCI_QH** tail = &pHCData->InterruptTail[pQH->EXT.Interval-1];
         result = EHCI_DetachQH(pQH, head, tail);
     }
+
+    //BUG-09: the QH is now unlinked from the async ring, but the controller may
+    //still hold a cached reference to it (EHCI 1.0 4.8.2); freeing it (or its
+    //qTDs) now can trigger an EHCI host system error. Wait for the HC to advance
+    //past it first. When the HC is halted / async off (e.g. shutdown HCRESET) the
+    //helper returns immediately -- no DMA in flight, nothing to flush (this is why
+    //BUG-09 was latent). Best-effort: after the bounded wait the QH is out of the
+    //ring and the HC has advanced regardless of the (flaky) IAA notification, so
+    //the free below is safe even on a doorbell timeout.
+    if(result)
+        EHCI_AsyncAdvanceDoorbell(pHCData);
 
     while(pTail != NULL) //remove unfinished TD
     {
