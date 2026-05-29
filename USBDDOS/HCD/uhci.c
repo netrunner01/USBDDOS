@@ -346,7 +346,7 @@ uint8_t UHCI_DataTransfer(HCD_Device* pDevice, void* pEndpoint, HCD_TxDir dir, u
     UHCI_TD* pHead = pQH->pTail;
     UHCI_TD* pEnd = NULL;
 
-    uint32_t CS = CS_C_ERR1 | (pDevice->bSpeed == USB_PORT_Low_Speed_Device ? CS_LowSpeed : 0) | ((pQH->Flags.Type == USB_ENDPOINT_TRANSFER_TYPE_ISOC) ? CS_IOS : 0);
+    uint32_t CS = CS_C_ERR3 | (pDevice->bSpeed == USB_PORT_Low_Speed_Device ? CS_LowSpeed : 0) | ((pQH->Flags.Type == USB_ENDPOINT_TRANSFER_TYPE_ISOC) ? CS_IOS : 0); //P5/BUG-10: tolerate 3 transaction errors before halt, matching control (uhci.c:224) and Linux uhci_maxerr(3); was C_ERR1 (single transient error -> spurious halt on noisy buses)
     uint16_t transferred = 0;
     CLIS();
     while(transferred < length)
