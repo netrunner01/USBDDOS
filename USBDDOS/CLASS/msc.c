@@ -194,9 +194,11 @@ BOOL USB_MSC_InitDevice(USB_Device* pDevice)
             
             //skip float library to save code size. it's the culprit that makes code seg exceeds 64K (found in map.txt)
             //there's no other floating points used in USBDDOS.
+            //P10/BUG-17: keep the true last-LBA in MaxLBA for bounds checks;
+            //a separate kilo-scaled scratch feeds the capacity DISPLAY only.
             uint32_t div = BlockSize >= 1024 ? BlockSize / 1024 : 1024 / BlockSize;
-            MaxLBA /= 1024;
-            uint32_t cap = BlockSize >= 1024 ? MaxLBA*div : MaxLBA/div;
+            uint32_t MaxLBA_K = MaxLBA / 1024;
+            uint32_t cap = BlockSize >= 1024 ? MaxLBA_K*div : MaxLBA_K/div;
             uint16_t capN = (uint16_t)(cap/1024);
             uint16_t capP = (uint16_t)(cap - ((uint32_t)capN)*1024UL);
             while(capP/10 != 0) capP = capP/10;
@@ -1281,9 +1283,20 @@ static BOOL USB_MSC_ReadSector(USB_Device* pDevice, uint32_t sector, uint16_t co
     USB_MSC_DriverData* pDriverData = (USB_MSC_DriverData*)pDevice->pDriverData;
     if(pDriverData == NULL)
         return FALSE;
-    if(size < count * pDriverData->BlockSize || sector + count > pDriverData->MaxLBA)
+    //P10/BUG-20: split the guard. Caller buffer too small = programming bug -> assert.
+    //Out-of-range sector = device/FS capacity mismatch -> log + graceful fail (no abort).
+    //Overflow-safe: valid LBAs are 0..MaxLBA, written as last-LBA <= MaxLBA so a
+    //0xFFFFFFFF READ CAPACITY(10) ">2TB" sentinel (SBC-2) can't wrap.
+    if(size < (size_t)count * pDriverData->BlockSize)
     {
         assert(FALSE);
+        return FALSE;
+    }
+    if(count == 0 || sector > pDriverData->MaxLBA ||
+       (uint32_t)(count - 1) > pDriverData->MaxLBA - sector)
+    {
+        _LOG("MSC read out of range: sector %lu count %u MaxLBA %lu\n",
+             (unsigned long)sector, (unsigned)count, (unsigned long)pDriverData->MaxLBA);
         return FALSE;
     }
 
@@ -1294,14 +1307,13 @@ static BOOL USB_MSC_ReadSector(USB_Device* pDevice, uint32_t sector, uint16_t co
     cmd.LBA = EndianSwap32(sector);
     cmd.TransferLength = EndianSwap16(count); //sector count
     uint32_t residue = 0; //P2: residue passthrough
-    //NOTE(P10): DataSize is BlockSize here while TransferLength=count (the
-    //count*BlockSize length bug). The guard below is correct for count==1 (all
-    //current callers) and becomes fully general once P10 fixes the data length.
-    if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(buf), pDriverData->BlockSize, HCD_TXR, &residue) != USB_MSC_XFER_OK)
+    //P10/BUG-21: data length is the full request (count sectors), not one block.
+    uint32_t dataLen = (uint32_t)count * pDriverData->BlockSize;
+    if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(buf), dataLen, HCD_TXR, &residue) != USB_MSC_XFER_OK)
         return FALSE;
     //P2: a Passed CSW that moved ZERO data (full residue) leaves buf as stale
     //data; fail rather than hand it back. Otherwise trust the Passed status.
-    if(residue >= pDriverData->BlockSize && !pDriverData->bIgnoreResidue)
+    if(residue >= dataLen && !pDriverData->bIgnoreResidue)
         return FALSE;
     return TRUE;
 }
