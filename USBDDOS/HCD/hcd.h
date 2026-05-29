@@ -95,6 +95,11 @@ typedef struct HCD_HostrControllerDriverMethod
 
     BOOL (*RemoveEndPoint)(HCD_Device* pDevice, void* pEndpoint);
 
+    //P7/BUG-02: best-effort host-side data-toggle reset after ClearHalt. TRUE if
+    //reset, FALSE if skipped (preconditions not safely met). Skipping degrades to
+    //the prior stale-toggle behavior - never a hang or corruption. May be NULL.
+    BOOL (*ResetEndpointToggle)(HCD_Device* pDevice, void* pEndpoint);
+
 }HCD_Method;
 
 typedef struct HCD_HostControllerType

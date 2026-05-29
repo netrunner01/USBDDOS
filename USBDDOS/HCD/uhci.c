@@ -42,6 +42,19 @@ static int  UHCI_WaitTDDone(UHCI_TD* pTD);
 #endif
 static UHCI_QH* UHCI_GetQHFromInterval(UHCI_HCData* pHCData, uint8_t interval);
 
+//P7/BUG-02: UHCI host toggle is the QH's SOFTWARE Flags.DataToggle (the HC never
+//reads it; it only seeds the next TD build). Single write, CLIS-guarded vs the
+//ISR's read-modify-write of that word. Bounded, can't fail.
+static BOOL UHCI_ResetEndpointToggle(HCD_Device* pDevice, void* pEndpoint)
+{
+    UHCI_QH* pQH = UHCI_ED_GETQH(pEndpoint); unused(pDevice);
+    if(pQH == NULL) return FALSE;
+    CLIS();
+    pQH->Flags.DataToggle = 0;
+    STIL();
+    return TRUE;
+}
+
 HCD_Method UHCIAccessMethod =
 {
     &UHCI_ControlTransfer,
@@ -54,6 +67,7 @@ HCD_Method UHCIAccessMethod =
     &UHCI_RemoveDevice,
     &UHCI_CreateEndpoint,
     &UHCI_RemoveEndpoint,
+    &UHCI_ResetEndpointToggle,
 };
 
 BOOL UHCI_InitController(HCD_Interface * pHCI, PCI_DEVICE* pPCIDev)

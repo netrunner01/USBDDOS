@@ -813,7 +813,24 @@ BOOL USB_ClearHalt(USB_Device* pDevice, uint8_t epAddr)
 {
     USB_Request req = {USB_REQ_WRITE|USB_REQTYPE_STANDARD|USB_REQREC_ENDPOINT, USB_REQ_CLEAR_FEATURE, ENDPOINT_HALT, 0, 0};
     req.wIndex = epAddr;
-    return USB_SyncSendRequest(pDevice, &req, NULL) == 0; //TODO: reset data toggle on ep
+    BOOL ok = USB_SyncSendRequest(pDevice, &req, NULL) == 0;
+    //P7/BUG-02: after the device-side halt clear, also reset the HOST-side data
+    //toggle so both ends resume at DATA0. Best-effort/per-HCD; if the HCD has no
+    //handler or can't do it safely, we proceed with the device-side clear alone
+    //(the prior behavior - no regression).
+    HCD_Method* pM = pDevice->HCDDevice.pHCI->pHCDMethod;
+    if(ok && pM->ResetEndpointToggle)
+    {
+        for(int i = 0; i < pDevice->bNumEndpoints; ++i)
+        {
+            if(pDevice->pEndpointDesc[i]->bEndpointAddress == epAddr)
+            {
+                pM->ResetEndpointToggle(&pDevice->HCDDevice, pDevice->pEndpoints[i]);
+                break;
+            }
+        }
+    }
+    return ok;
 }
 
 void USB_IdleWait()

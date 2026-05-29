@@ -79,6 +79,24 @@ static void OHCI_BuildISOED(OHCI_ED* pED, uint8_t FunctionAddress, uint8_t Endpo
 static void OHCI_BuildHCCA(OHCI_HCData* pHCDData);
 static OHCI_ED** OHCI_GetEDFromInterval(OHCI_HCData* pHCDData, uint8_t interval);
 
+//P7/BUG-02: OHCI host toggle = C (toggleCarry, bit1) of ED HeadP. OHCI 1.0a 4.2
+//forbids writing HeadP unless the ED is Halted, sKip set, or unlinked. We take
+//ONLY the spec-legal no-wait case: empty + halted (post-STALL) -> clear C. Any
+//other state is skipped - the error-drain path (ohci.c ~656) and freshly-created
+//EDs both already leave C=0, so skipping never leaves an incorrect toggle and we
+//never race a live ED.
+static BOOL OHCI_ResetEndpointToggle(HCD_Device* pDevice, void* pEndpoint)
+{
+    OHCI_ED* pED = (OHCI_ED*)pEndpoint; unused(pDevice);
+    if(pED == NULL) return FALSE;
+    if(((pED->HeadP & ~0xFUL) == pED->TailP) && (pED->HeadP & 0x1UL)) //empty && halted(ED_H)
+    {
+        pED->HeadP &= ~0x2UL; //clear ED_C (toggleCarry)
+        return TRUE;
+    }
+    return FALSE; //skip: not in a spec-legal no-wait state
+}
+
 HCD_Method OHCI_Method =
 {
     &OHCI_ControlTransfer,
@@ -91,6 +109,7 @@ HCD_Method OHCI_Method =
     &OHCI_RemoveDevice,
     &OHCI_CreateEndpoint,
     &OHCI_RemoveEndpoint,
+    &OHCI_ResetEndpointToggle,
 };
 
 BOOL OHCI_InitController(HCD_Interface* pHCI, PCI_DEVICE* pPCIDev)

@@ -48,6 +48,7 @@ HCD_Method EHCI_AccessMethod =
     &EHCI_RemoveDevice,
     &EHCI_CreateEndpoint,
     &EHCI_RemoveEndpoint,
+    NULL, //P7b: EHCI host-toggle reset deferred (needs IAA doorbell; batched with P8)
 };
 
 static void EHCI_ResetHC(HCD_Interface* pHCI);
