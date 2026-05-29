@@ -291,6 +291,12 @@ typedef struct
     void* pDataEP[2]; //bulk in/out
     uint8_t bEPAddr[2];
     uint32_t DOSDriverMem;
+    //P2: reserved IGNORE_RESIDUE quirk hook for bridges that report bogus
+    //residue (cf. Linux US_FL_IGNORE_RESIDUE, u-boot). When set, residue is
+    //treated as 0 (suppresses the catastrophic-residue read/write fault and the
+    //diagnostic log). NOT yet populated - no device-match table wired up.
+    //Seeds for a future table: Initio INIC-3619, JMicron 152d:0567, SuperTop 14cd:6600.
+    uint8_t bIgnoreResidue;
 }USB_MSC_DriverData;
 
 #ifdef __cplusplus

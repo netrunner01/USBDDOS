@@ -687,13 +687,17 @@ static void USB_MSC_DOS_DriverINT()
             uint32_t step = max(16*1024/pDriverData->BlockSize,1);
             #endif
             uint32_t off = 0;
+#if DEBUG
+            BOOL residueLogged = FALSE;
+#endif
             while(count > 0)
             {
                 uint16_t tc = (uint16_t)min(count, step);
                 uint16_t tlen = (uint16_t)(tc * pDriverData->BlockSize);
                 cmd.LBA = EndianSwap32(start+off);
                 cmd.TransferLength = EndianSwap16(tc);
-                USB_MSC_XferStatus rdst = USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_FP2L(request.ReadWrite.Address)+off*pDriverData->BlockSize, tlen, HCD_TXR, NULL);
+                uint32_t residue = 0; //P2: residue passthrough
+                USB_MSC_XferStatus rdst = USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_FP2L(request.ReadWrite.Address)+off*pDriverData->BlockSize, tlen, HCD_TXR, &residue);
                 if(rdst != USB_MSC_XFER_OK)
                 {
 #if DEBUG
@@ -706,6 +710,24 @@ static void USB_MSC_DOS_DriverINT()
                     request.Header.Status = DOS_DRSS_ERRORBIT | DOS_DRSS_READ_FAULT;
                     request.ReadWrite.Count = 0;
                     break;
+                }
+                //P2/C-3: bCSWStatus is authoritative (P1). Residue is informational
+                //and frequently bogus (Linux US_FL_IGNORE_RESIDUE; u-boot passes it
+                //through - neither hard-fails a Passed command on residue). Trust a
+                //Passed status; only a Passed CSW that moved ZERO data (residue ==
+                //full request) is self-contradictory -> surface a read fault.
+                //No zero-fill, no MSC-level retry.
+                if(residue != 0 && !pDriverData->bIgnoreResidue)
+                {
+#if DEBUG
+                    if(!residueLogged) { _LOG("MSC READ residue %lu/%u (status OK)\n", (unsigned long)residue, (unsigned)tlen); residueLogged = TRUE; }
+#endif
+                    if(residue >= tlen)
+                    {
+                        request.Header.Status = DOS_DRSS_ERRORBIT | DOS_DRSS_READ_FAULT;
+                        request.ReadWrite.Count = 0;
+                        break;
+                    }
                 }
                 off += tc;
                 count -= tc;
@@ -729,13 +751,17 @@ static void USB_MSC_DOS_DriverINT()
             uint32_t step = max(16*1024/pDriverData->BlockSize,1);
             #endif
             uint32_t off = 0;
+#if DEBUG
+            BOOL residueLogged = FALSE;
+#endif
             while(count > 0)
             {
                 uint16_t tc = (uint16_t)min(count, step);
                 uint16_t tlen = (uint16_t)(tc * pDriverData->BlockSize);
                 cmd.LBA = EndianSwap32(start+off);
                 cmd.TransferLength = EndianSwap16(tc);
-                USB_MSC_XferStatus wrst = USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_FP2L(request.ReadWrite.Address)+off*pDriverData->BlockSize, tlen, HCD_TXW, NULL);
+                uint32_t residue = 0; //P2: residue passthrough
+                USB_MSC_XferStatus wrst = USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_FP2L(request.ReadWrite.Address)+off*pDriverData->BlockSize, tlen, HCD_TXW, &residue);
                 if(wrst != USB_MSC_XFER_OK)
                 {
 #if DEBUG
@@ -748,6 +774,21 @@ static void USB_MSC_DOS_DriverINT()
                     request.Header.Status = DOS_DRSS_ERRORBIT | DOS_DRSS_WRITE_FAULT;
                     request.ReadWrite.Count = 0;
                     break;
+                }
+                //P2/C-3: see READ path. Residue is informational; a Passed CSW that
+                //accepted ZERO data (residue == full request) is self-contradictory
+                //-> surface a write fault. Otherwise trust the Passed status.
+                if(residue != 0 && !pDriverData->bIgnoreResidue)
+                {
+#if DEBUG
+                    if(!residueLogged) { _LOG("MSC WRITE residue %lu/%u (status OK)\n", (unsigned long)residue, (unsigned)tlen); residueLogged = TRUE; }
+#endif
+                    if(residue >= tlen)
+                    {
+                        request.Header.Status = DOS_DRSS_ERRORBIT | DOS_DRSS_WRITE_FAULT;
+                        request.ReadWrite.Count = 0;
+                        break;
+                    }
                 }
                 off += tc;
                 count -= tc;
@@ -886,7 +927,12 @@ static BOOL USB_MSC_DOS_InstallDevice(USB_Device* pDevice)     //ref: https://gi
             cmd.LBA = EndianSwap32(VBRSector + TSRData.bpb.DOS70.FSSector);
             cmd.TransferLength = EndianSwap16(1); //sector count
             uint8_t* FSSector = (uint8_t*)malloc(pDriverData->BlockSize);
-            BOOL result = (USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(FSSector), pDriverData->BlockSize, HCD_TXR, NULL) == USB_MSC_XFER_OK);
+            uint32_t fsResidue = 0; //P2: residue passthrough
+            BOOL result = (USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(FSSector), pDriverData->BlockSize, HCD_TXR, &fsResidue) == USB_MSC_XFER_OK);
+            //P2: a Passed read that moved ZERO data (full residue) leaves the FS-info
+            //sector as garbage; don't trust it (the free-cluster count is optional).
+            if(result && fsResidue >= pDriverData->BlockSize && !pDriverData->bIgnoreResidue)
+                result = FALSE;
             if(result)
             { //https://en.wikipedia.org/wiki/Design_of_the_FAT_file_system#FS_Information_Sector
                 FreeClusters = *(uint32_t*)&FSSector[0x1E8];
@@ -1247,7 +1293,17 @@ static BOOL USB_MSC_ReadSector(USB_Device* pDevice, uint32_t sector, uint16_t co
     cmd.LUN = 0;
     cmd.LBA = EndianSwap32(sector);
     cmd.TransferLength = EndianSwap16(count); //sector count
-    return USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(buf), pDriverData->BlockSize, HCD_TXR, NULL) == USB_MSC_XFER_OK;
+    uint32_t residue = 0; //P2: residue passthrough
+    //NOTE(P10): DataSize is BlockSize here while TransferLength=count (the
+    //count*BlockSize length bug). The guard below is correct for count==1 (all
+    //current callers) and becomes fully general once P10 fixes the data length.
+    if(USB_MSC_IssueCommand(pDevice, &cmd, sizeof(cmd), DPMI_PTR2L(buf), pDriverData->BlockSize, HCD_TXR, &residue) != USB_MSC_XFER_OK)
+        return FALSE;
+    //P2: a Passed CSW that moved ZERO data (full residue) leaves buf as stale
+    //data; fail rather than hand it back. Otherwise trust the Passed status.
+    if(residue >= pDriverData->BlockSize && !pDriverData->bIgnoreResidue)
+        return FALSE;
+    return TRUE;
 }
 
 #if DEBUG && 0
