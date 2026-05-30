@@ -548,38 +548,66 @@ uint8_t USB_Transfer(USB_Device* pDevice, void* pEndpoint, uint8_t* pBuffer, uin
     return pFn(&pDevice->HCDDevice, pEndpoint, dir, dma, length, USB_Completion_UserCallback, pUserData);
 }
 
+//P4/R-1: the BUG-06 fix makes UHCI build one TD per wMaxPacketSize packet, so a large
+//bulk transfer would allocate length/64 TDs up front -- a 16 KB MSC chunk = 256 TDs
+//(half the 512-TD release pool), and the DJGPP step=count path (msc.c) can pass up to
+//64 KB. Cap UHCI transfers into <=8 KiB sub-transfers: USB_SyncTransfer blocks until the
+//ISR frees each batch, so peak live TDs ~= 8192/64 = 128 (~25% of the pool), and the
+//UHCI data toggle persists in the QH across calls (uhci.c writeback) so the device sees
+//one continuous bulk stream. Other HCDs carry many bytes per TD and keep the single-shot
+//path (chunk == length below). Control/CBW/CSW transfers are small, so are never split.
+#define USB_UHCI_SYNC_CHUNK (8*1024)
 uint8_t USB_SyncTransfer(USB_Device* pDevice, void* pEndpoint, uint8_t* pBuffer, uint16_t length, uint16_t* txlen)
 {
-    USB_SyncCallbackResult result;
-    result.Finished = FALSE;
+    uint16_t chunk = length;
+    if(pDevice->HCDDevice.pHCI->pType->dwPI == 0x00 /*UHCI prog-if*/ && length > USB_UHCI_SYNC_CHUNK)
+        chunk = USB_UHCI_SYNC_CHUNK;
 
-    uint8_t error = USB_Transfer(pDevice, pEndpoint, pBuffer, length, USB_Completion_SyncCallback, &result);
-    if(error != 0)
+    uint16_t total = 0;
+    do
     {
-        assert(FALSE);
-        return error;
-    }
+        uint16_t sub = (uint16_t)min((uint16_t)(length - total), chunk);
+
+        USB_SyncCallbackResult result;
+        result.Finished = FALSE;
+        uint8_t error = USB_Transfer(pDevice, pEndpoint, pBuffer + total, sub, USB_Completion_SyncCallback, &result);
+        if(error != 0)
+        {
+            assert(FALSE);
+            *txlen = total;
+            return error;
+        }
 
 #if USB_MASK_IRQ_ON_IDLEWAIT
-    CLIS();
-    uint16_t mask = PIC_GetIRQMask();
-    PIC_SetIRQMask(PIC_IRQ_UNMASK(0xFFFF,pDevice->HCDDevice.pHCI->PCI.Header.DevHeader.Device.IRQ)); //only enable current controlelr IRQ
-    STIL();
-#endif
-
-    //idle wait for interrupt (HW notifying finish event and hcd driver call USB_Completion_Callback)
-    while(!result.Finished)
-        USB_IDLE_WAIT();
-
-#if USB_MASK_IRQ_ON_IDLEWAIT
-    {
         CLIS();
-        PIC_SetIRQMask(mask);
+        uint16_t mask = PIC_GetIRQMask();
+        PIC_SetIRQMask(PIC_IRQ_UNMASK(0xFFFF,pDevice->HCDDevice.pHCI->PCI.Header.DevHeader.Device.IRQ)); //only enable current controller IRQ
         STIL();
-    }
 #endif
-    *txlen = result.Length;
-    return result.ErrorCode;
+
+        //idle wait for interrupt (HW notifying finish event and hcd driver call USB_Completion_Callback)
+        while(!result.Finished)
+            USB_IDLE_WAIT();
+
+#if USB_MASK_IRQ_ON_IDLEWAIT
+        {
+            CLIS();
+            PIC_SetIRQMask(mask);
+            STIL();
+        }
+#endif
+        total = (uint16_t)(total + result.Length);
+        if(result.ErrorCode != 0)
+        {
+            *txlen = total;
+            return result.ErrorCode;
+        }
+        if(result.Length < sub) //short packet: device signalled end of data
+            break;
+    } while(total < length);
+
+    *txlen = total;
+    return 0;
 }
 
 void* USB_FindEndpoint(USB_Device* pDevice, USB_EndpointDesc* pDesc)

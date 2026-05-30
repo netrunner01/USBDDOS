@@ -338,7 +338,14 @@ uint8_t UHCI_DataTransfer(HCD_Device* pDevice, void* pEndpoint, HCD_TxDir dir, u
     uint8_t bEndpoint = UHCI_ED_GETADDR(pEndpoint);
     uint8_t PID = (dir == HCD_TXW) ? OUTPID : INPID;
     assert(pQH->Flags.wMaxPacketSize);
-    uint16_t MaxLen = (uint16_t)max(pQH->Flags.wMaxPacketSize, (1023/pQH->Flags.wMaxPacketSize-1)*pQH->Flags.wMaxPacketSize); //USB1.1 spec 0~1023 bytes data packet
+    //P4/BUG-06: UHCI is one transaction per TD (Design Guide 3.2.3) -- each TD carries
+    //exactly one packet, so MaxLen must be wMaxPacketSize. The old max(...1023...)
+    //formula produced 896 for a 64-byte EP; on real UHCI that scatters 64-byte packets
+    //into 896-spaced buffer slots / halts on the short packet (Bochs masked it by moving
+    //the full MaxLen per TD). Matches the control path (uhci.c:222) and OSDev's bulk
+    //MaxLen=wMaxPacketSize. The resulting TD-count growth is bounded by the UHCI 8 KiB
+    //sub-transfer split in USB_SyncTransfer (R-1).
+    uint16_t MaxLen = pQH->Flags.wMaxPacketSize;
     //_LOG("EPADDR: %x, MAXLEN: %d\n", bEndpoint, MaxLen);
     uint8_t Toggle = pQH->Flags.DataToggle;
     HCD_Request* pRequest = HCD_AddRequest(pDevice, pEndpoint, dir, pBuffer, length, bEndpoint, pCB, pCBData);
@@ -439,8 +446,14 @@ void UHCI_ISR_ProcessTD(HCD_Interface* pHCI, UHCI_QH* pQH)
     if(pTD && error)
     {
         assert(!pTD->ControlStatusBits.Active && pTD == pQH->pTail || pTD->ControlStatusBits.Active); //TODO:
-        assert(pTD->PAddr);
-        pQH->ElementLink = pTD->PAddr | DepthSelect;
+        //P4: on error the loop can consume every TD, leaving pTD == pQH->pTail (the
+        //empty tail), whose PAddr is still 0 until it is built. The BUG-06 MaxLen fix
+        //makes exact-size HID polls reach this branch, where the old assert(pTD->PAddr)
+        //tripped (debug) / set ElementLink to ~phys 0 (release). Compute the tail's
+        //physical address the same way UHCI_BuildTD does for the not-yet-built next TD
+        //(uhci.c:758). The first assert above already permits pTD == pQH->pTail.
+        uint32_t paddr = pTD->PAddr ? pTD->PAddr : DPMI_PTR2P(pTD);
+        pQH->ElementLink = paddr | DepthSelect;
     }
     //assert(pQH->pTail == NULL || pQH->pTail->pPrev == NULL); //TODO:
 
