@@ -214,6 +214,15 @@ int main(int argc, char* argv[])
 #endif
 
 
+#if DEBUG
+    // Diagnostic/debug builds stamp the version + build string into the _LOG
+    // (COM1) stream so a captured serial log self-identifies which binary
+    // produced it -- a tester's report can be tied to an exact build without a
+    // separate screenshot of the on-screen banner.
+    _LOG("==== USBDDOS DIAGNOSTIC/DEBUG build ====\n");
+    _LOG("version %d.%02d, build %s\n", USBDDOS_VERSION>>8, USBDDOS_VERSION&0xFF, USBDDOS_BUILD);
+#endif
+
     DPMI_Init();
 
 
