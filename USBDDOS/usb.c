@@ -323,6 +323,19 @@ BOOL USB_InitDevice(HCD_HUB* pHub, uint8_t portIndex, uint16_t portStatus)
             assert(pDevice->bStatus == DS_Configured);
             break;
         }
+        //P6/C-2: a failed attempt may have partially enumerated (EP0 created,
+        //possibly addressed). Roll back to Default before retrying, else the
+        //SET_ADDRESS path re-enters with a stale non-zero bAddress (tripping its
+        //bAddress==0 assert) and a leaked EP0. The port reset is the first action
+        //in USB_ConfigDevice, so the retry re-resets the port; delay(100) settles.
+        if(pDevice->pDefaultControlEP != NULL)
+        {
+            pDevice->HCDDevice.pHCI->pHCDMethod->RemoveEndPoint(&pDevice->HCDDevice, pDevice->pDefaultControlEP);
+            pDevice->pDefaultControlEP = NULL;
+        }
+        pDevice->HCDDevice.bAddress = 0;
+        pDevice->bStatus = DS_Default;
+        delay(100);
         //pHub->SetPortStatus(pHub, portIndex, USB_PORT_DISABLE); //disable it to continue enumeration on next port - RemoveDevice will do it
     }
     // install device driver
@@ -974,7 +987,20 @@ static BOOL USB_ConfigDevice(USB_Device* pDevice, uint8_t address)
     //first try may fail because incorrect max packet size
     USB_DeviceDesc* pDesc = (USB_DeviceDesc*)Buffer;
     _LOG("USB: ep0 max packet size: %d->%d\n", pDevice->Desc.bMaxPacketSize, pDesc->bMaxPacketSize);
-    if(pDesc->bMaxPacketSize && pDesc->bMaxPacketSize != pDevice->Desc.bMaxPacketSize)
+    //P6/C-2: accept-if-valid precedes retry. We ask for 64 and tolerate a short/
+    //babbled reply (V-e), but only trust it if it is actually a DEVICE descriptor
+    //with a legal EP0 max packet size -- USB 2.0 allows only 8/16/32/64 (Linux usb
+    //core). Otherwise fail so the outer loop retries with a fresh reset instead of
+    //configuring EP0 from garbage. (bDescriptorType and bMaxPacketSize both lie
+    //within the first 8 bytes, so this validates even on an 8-byte short read.)
+    if(pDesc->bDescriptorType != USB_DT_DEVICE ||
+       (pDesc->bMaxPacketSize != 8 && pDesc->bMaxPacketSize != 16 &&
+        pDesc->bMaxPacketSize != 32 && pDesc->bMaxPacketSize != 64))
+    {
+        _LOG("USB: invalid initial device descriptor (type=%02x maxpacket=%d); retrying\n", pDesc->bDescriptorType, pDesc->bMaxPacketSize);
+        return FALSE;
+    }
+    if(pDesc->bMaxPacketSize != pDevice->Desc.bMaxPacketSize)
     {
         pDevice->Desc.bMaxPacketSize = pDesc->bMaxPacketSize;
         pDevice->HCDDevice.pHCI->pHCDMethod->RemoveEndPoint(&pDevice->HCDDevice, pDevice->pDefaultControlEP);
