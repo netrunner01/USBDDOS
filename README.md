@@ -41,6 +41,67 @@ issue](https://github.com/Netrunner01/USBDDOS/issues) with the results
 either way — that's the single most useful contribution this project
 needs right now.
 
+## Supported devices and scope
+
+This driver has a deliberately narrow mission: **robust, fault-tolerant
+support for USB keyboards, mice, and mass-storage devices** on basic
+**USB 1.x and USB 2.0** hardware. Within that mission the priority is
+reliability — clean enumeration, correct data transfer, and graceful
+recovery from errors and from devices it does not handle — not breadth
+of device support.
+
+**Supported** — the device classes the driver is built and tested for:
+
+* **HID keyboards** (boot protocol).
+* **HID mice** (boot protocol).
+* **Mass storage** — Bulk-Only Transport (BOT/BBB), SCSI block devices.
+* **Hubs** — *best-effort.* Hub support is **attempted** so that the
+  keyboard / mouse / disk devices above can sit behind a hub. It is the
+  least-mature path and is not guaranteed to work on every controller.
+
+**Caveat for pointing and composite HID devices.** Keyboard and mouse
+support uses the HID **boot protocol**, which assumes a standard
+keyboard report and a **relative**-motion pointer (X/Y deltas). Devices
+that instead depend on **absolute** positioning — graphics / digitizer
+pads, many trackpads, and some trackballs — **may not work**, because
+the absolute-coordinate reporting they rely on is outside the boot
+protocol and may not be handled. **Composite keyboards** (a single
+device that folds extra functions — an integrated touchpad, media/
+consumer-control keys, or a built-in hub — into one unit) may likewise
+fail or work only partially (e.g. the keys enumerate but the pointer
+does not). The dependable case is a plain boot-protocol keyboard or a
+relative-motion mouse/trackball.
+
+**Host controllers:** UHCI and OHCI (USB 1.x) and EHCI (USB 2.0).
+**xHCI / USB 3.x is not supported.**
+
+**Not supported — and that is on purpose.** USB audio, Bluetooth,
+Wi-Fi, video (UVC / webcams), printers, network adapters, and other
+vendor-specific or higher-function device classes are **out of scope by
+design**. The driver is meant to stay small and dependable on
+386–early-Pentium hardware, where handling arbitrary device classes
+would add size, complexity, and failure modes with no benefit to the
+keyboard / mouse / disk use case it exists to serve.
+
+**Tolerating unsupported devices is itself a goal.** When a device the
+driver does not handle is present — including at boot — the driver is
+expected to recognize it, decline to drive it, and keep running, rather
+than hang or crash. (This is why the QEMU regression suite includes an
+`ohci-audio` case: it verifies the driver coexists with an unsupported
+class *safely* — **not** that audio is supported.)
+
+**So "my `<device>` doesn't work" is, for anything outside the
+supported set above, working as designed — not a defect.** An
+out-of-scope class the driver ignores, an absolute-positioning pointer
+that won't track, or a composite device that only partly enumerates are
+all expected outcomes of the scope above, not bugs. The behaviors that
+*do* count as defects are narrow: a **supported** device (boot-protocol
+keyboard, relative-motion mouse, mass storage, or a hub carrying them)
+failing on supported USB 1.x/2.x hardware, or **any** device — supported
+or not — making the driver **hang or crash** rather than being safely
+ignored. Those are worth reporting; "unsupported device X does nothing"
+is not.
+
 ## Why this fork exists
 
 When this fork was started in May 2026, upstream `crazii/USBDDOS` had
@@ -104,7 +165,8 @@ working solution upstream:
 If your problem isn't on this list, this fork is unlikely to help —
 it does NOT add new features beyond what upstream offers (USB
 1.1/2.0 host controllers, HID keyboard/mouse, mass storage, CDC,
-hub class). Two known bugs in upstream are deliberately NOT yet
+hub class — see **Supported devices and scope** above for the narrower
+set this driver treats as supported targets). Two known bugs in upstream are deliberately NOT yet
 patched here: NEC `kErrataNECIncompleteWrite` write-1-to-clear
 retries on `HcRhPortStatus` (Gap 7 in our planning notes) and full
 EHCI USBLEGSUP/USBLEGCTLSTS BIOS handoff for the Intel ICH4+
@@ -204,6 +266,14 @@ This fork's tracker is on this repository
 ([issues page](https://github.com/Netrunner01/USBDDOS/issues)). Issues
 that are about upstream USBDDOS rather than this fork's specific
 changes belong on [upstream's tracker](https://github.com/crazii/USBDDOS/issues).
+
+Before filing "device X doesn't work," check **Supported devices and
+scope** above. Non-function of an out-of-scope device — or of an
+absolute-positioning or composite HID device — is **by design, not a
+defect**, and such reports are closed as working-as-intended. What *is*
+wanted: a **supported** device failing on supported USB 1.x/2.x
+hardware, or **any** device causing a hang or crash instead of being
+safely ignored.
 
 ## Common symptoms this fork addresses
 
