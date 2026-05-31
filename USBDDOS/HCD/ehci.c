@@ -76,6 +76,15 @@ BOOL EHCI_InitController(HCD_Interface * pHCI, PCI_DEVICE* pPCIDev)
 
     uint32_t usbbase = (*(uint32_t*)&pPCIDev->Offset[USBBASE]) & 0xFFFFFFE0L;
     pHCI->dwPhysicalAddress = usbbase;
+    if(usbbase == 0)
+    {
+        //base 0 = controller disabled/unconfigured (e.g. USB off in BIOS, which
+        //leaves the BAR unprogrammed). PCI hardwires unimplemented/unassigned BARs
+        //to 0 (PCI 3.0 6.2.5.1); on a PC a working USB controller is never mapped
+        //at physical 0, so 0 is an unambiguous "skip". Mapping/MMIO at 0 would hang.
+        _LOG("EHCI: no USBBASE (USB disabled in BIOS?); skipping controller.\n");
+        return FALSE;
+    }
     pHCI->dwBaseAddress = DPMI_MapMemory(pHCI->dwPhysicalAddress, 4096);
     _LOG("EHCI USBBASE: %08lx %08lx\n", pHCI->dwPhysicalAddress, pHCI->dwBaseAddress);
     pHCI->pHCDMethod = &EHCI_AccessMethod;

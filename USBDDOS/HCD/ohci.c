@@ -124,6 +124,15 @@ BOOL OHCI_InitController(HCD_Interface* pHCI, PCI_DEVICE* pPCIDev)
     PCI_WriteWord(pHCI->PCIAddr.Bus, pHCI->PCIAddr.Device, pHCI->PCIAddr.Function, PCI_REGISTER_CMD, cmd.reg16);
     // map to linear
     pHCI->dwPhysicalAddress = pPCIDev->Header.DevHeader.Device.Base0 & 0xffffffe0;                                            // BAR0
+    if(pHCI->dwPhysicalAddress == 0)
+    {
+        //base 0 = controller disabled/unconfigured (e.g. USB off in BIOS, which
+        //leaves the BAR unprogrammed). PCI hardwires unimplemented/unassigned BARs
+        //to 0 (PCI 3.0 6.2.5.1); on a PC a working USB controller is never mapped
+        //at physical 0, so 0 is an unambiguous "skip". Mapping/MMIO at 0 would hang.
+        _LOG("OHCI: no BAR base (USB disabled in BIOS?); skipping controller.\n");
+        return FALSE;
+    }
     uint32_t size = PCI_Sizing(pHCI->PCIAddr.Bus, pHCI->PCIAddr.Device, pHCI->PCIAddr.Function, OHCI_REGISTER_BAR); // should be 4K according to the spec
     pHCI->dwBaseAddress = DPMI_MapMemory(pHCI->dwPhysicalAddress, size);
     _LOG("OHCI BAR address: %08lx, mapped address %08lx, size: %08lx\n", pHCI->dwPhysicalAddress, pHCI->dwBaseAddress, size);

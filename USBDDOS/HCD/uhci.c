@@ -92,6 +92,16 @@ BOOL UHCI_InitController(HCD_Interface * pHCI, PCI_DEVICE* pPCIDev)
     pHCI->dwPhysicalAddress = (*(uint32_t*)&pPCIDev->Offset[USBBASE]) & 0xFFFFFFE0L;
     pHCI->dwBaseAddress = pHCI->dwPhysicalAddress;    //PIO address
     _LOG("UHCI base IO address: %04x\n", pHCI->dwBaseAddress);
+    if(pHCI->dwBaseAddress == 0)
+    {
+        //base 0 = controller disabled/unconfigured (e.g. USB off in BIOS, which
+        //leaves the I/O BAR unprogrammed). PCI hardwires unimplemented/unassigned
+        //BARs to 0 (PCI 3.0 6.2.5.1); on a PC a working USB controller is never
+        //based at port 0 (0x000-0x0FF is reserved for legacy devices), so 0 is an
+        //unambiguous "skip" here. Proceeding would do port I/O at 0x0000 and hang.
+        _LOG("UHCI: no I/O base (USB disabled in BIOS?); skipping controller.\n");
+        return FALSE;
+    }
     pHCI->pHCDMethod = &UHCIAccessMethod;
     UHCI_ResetHC(pHCI);
 
