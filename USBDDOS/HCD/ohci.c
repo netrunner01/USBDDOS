@@ -198,7 +198,7 @@ BOOL OHCI_InitController(HCD_Interface* pHCI, PCI_DEVICE* pPCIDev)
         DPMI_StoreD(dwBase + HcFmInterval, FrameInterval);
 
     // get ports
-    pHCI->bNumPorts = DPMI_LoadB(dwBase + HcRhDescriptorA); // low 8bit of a register
+    pHCI->bNumPorts = (uint8_t)(DPMI_LoadD(dwBase + HcRhDescriptorA) & 0xFF); // OHCI regs are 32-bit; a byte MMIO read of NDP returns 0 on some HCs/emulators
     _LOG("Numports: %d\n", pHCI->bNumPorts);
 
     pHCI->pHCDMethod = &OHCI_Method;
@@ -568,7 +568,7 @@ uint8_t OHCI_IsochronousTransfer(HCD_Device* pDevice, void* pEndpoint, HCD_TxDir
     uint32_t dwIOBase = pDevice->pHCI->dwBaseAddress;
     uint32_t BufferAddress = DPMI_PTR2P(pBuffer);
     uint16_t MaxLen = min(length, pED->ControlBits.MaxPacketSize); // used by Offset. OHCI require maxlen <= max parcket size. although it doesn't requre the HC to perform the check.
-    uint16_t StartFrame = (uint16_t)(DPMI_LoadW(dwIOBase + HcFmNumber) + 2); // advance 2 frame incase miss the whole thing. TODO: use SOF?
+    uint16_t StartFrame = (uint16_t)((DPMI_LoadD(dwIOBase + HcFmNumber) & 0xFFFF) + 2); // OHCI regs are 32-bit; read dword and mask. advance 2 frame incase miss the whole thing. TODO: use SOF?
     uint16_t transferred = 0;
     while(transferred < length)
     {
