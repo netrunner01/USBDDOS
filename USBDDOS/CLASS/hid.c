@@ -696,10 +696,19 @@ static void USB_HID_InputMouse(USB_Device* pDevice)
     USB_HID_DriverData* pDriverData = (USB_HID_DriverData*)pDevice->pDriverData;
     USB_HID_Interface* mouse = &pDriverData->Interface[USB_HID_MOUSE];
     USB_HID_Data* data = &mouse->Data[mouse->Index];
+    USB_HID_Data* prev = &mouse->Data[(mouse->Index+1)&0x1];
 
-    //already set indefinite idle, but idle is optional for boot mouse
-    //if((data->Mouse.Button&0x7) == 0 && data->Mouse.DX == 0 && data->Mouse.DY == 0) //this will skip a button up event
-    //    return;
+    //Skip idle reports. Gap-K keeps the device in minimal idle (SET_IDLE report-every-cycle),
+    //so the device sends a report on EVERY polling cycle whether or not anything moved. Without
+    //this guard the 8042 PS/2-injection finalizer below is queued on every cycle and runs the full
+    //(slow, multi-port-I/O) injection dance from USB-IRQ context continuously, even with the mouse
+    //at rest - starving the DOS foreground so control never returns after the driver goes resident.
+    //The keyboard path has the equivalent no-change guard (see USB_HID_InputKeyboard). DX/DY are
+    //relative deltas, so zero means no motion; Button is compared against the PREVIOUS report rather
+    //than against zero so a button-release (button bit clears) still generates a sample - that was
+    //the defect that caused the original guard here to be commented out.
+    if(data->Mouse.DX == 0 && data->Mouse.DY == 0 && data->Mouse.Button == prev->Mouse.Button)
+        return;
 
     USB_ISR_Finalizer* finalizer = (USB_ISR_Finalizer*)malloc(sizeof(USB_ISR_Finalizer));
     finalizer->FinalizeISR = USB_HID_Mouse_Finalizer;
