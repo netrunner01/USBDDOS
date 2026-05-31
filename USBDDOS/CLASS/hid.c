@@ -131,9 +131,17 @@ static uint8_t USB_HID_KEYBOARD_USAGE2SCANCODES[256*2] =
 #define USB_HID_BIOS_CAPSLOCK_S 0x0040 //caps locked staus
 #define USB_HID_BIOS_MMASK      0x0070
 
-#define WAIT_KEYBOARD_IN_EMPTY() while((inp(0x64)&2))
-#define WAIT_KEYBOARD_OUT_EMPTY() while((inp(0x64)&1)) {STI();NOP();NOP();NOP();CLI();}//USB_IdleWait()
-#define WAIT_EKYBOARD_OUT_FULL() while(!(inp(0x64)&1))
+/* The 8042 spin-waits are bounded so a non-responsive controller cannot hang
+ * the machine - e.g. an emulator that doesn't implement the 0xD3 mouse
+ * output-buffer command (OBF never sets), or the absence of any IRQ12 consumer
+ * to drain OBF. KBD_8042_SPIN_MAX is ~1s worth of ISA port reads on a 486-class
+ * machine, far longer than the microsecond-scale normal 8042 response, so it
+ * never trips on working hardware. On timeout the wait breaks and (DEBUG only)
+ * logs which wait gave up. */
+#define KBD_8042_SPIN_MAX 20000UL
+#define WAIT_KEYBOARD_IN_EMPTY() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while((inp(0x64)&2)){ if(!--_kt){ _LOG("8042 timeout: IN_EMPTY\n"); break; } } }while(0)
+#define WAIT_KEYBOARD_OUT_EMPTY() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while((inp(0x64)&1)){ STI();NOP();NOP();NOP();CLI(); if(!--_kt){ _LOG("8042 timeout: OUT_EMPTY\n"); break; } } }while(0)//USB_IdleWait()
+#define WAIT_EKYBOARD_OUT_FULL() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while(!(inp(0x64)&1)){ if(!--_kt){ _LOG("8042 timeout: OUT_FULL\n"); break; } } }while(0)
 
 //keyboard device input processing
 static BOOL USB_HID_Keyboard_IsInputEmpty(const USB_HID_Data* data);
