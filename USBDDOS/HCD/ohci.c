@@ -110,6 +110,7 @@ HCD_Method OHCI_Method =
     &OHCI_CreateEndpoint,
     &OHCI_RemoveEndpoint,
     &OHCI_ResetEndpointToggle,
+    NULL, //AbortControl: not yet implemented for OHCI (timeout falls back to wait)
 };
 
 BOOL OHCI_InitController(HCD_Interface* pHCI, PCI_DEVICE* pPCIDev)

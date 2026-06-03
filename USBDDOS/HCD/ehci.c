@@ -50,6 +50,7 @@ HCD_Method EHCI_AccessMethod =
     &EHCI_CreateEndpoint,
     &EHCI_RemoveEndpoint,
     &EHCI_ResetEndpointToggle, //P7b: EHCI host-toggle reset (IAA doorbell + overlay clear)
+    NULL, //AbortControl: not yet implemented for EHCI (timeout falls back to wait)
 };
 
 static void EHCI_ResetHC(HCD_Interface* pHCI);
