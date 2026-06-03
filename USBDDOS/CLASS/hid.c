@@ -142,7 +142,12 @@ static uint8_t USB_HID_KEYBOARD_USAGE2SCANCODES[256*2] =
 /* The 8042 inject can time out on every report on a controller with no PS/2
  * mouse channel behind it; logging each one floods the serial console and,
  * since this runs in interrupt context, starves the ISR. Log the first few,
- * then suppress. */
+ * then suppress. Worse, the bounded waits themselves cost hundreds of
+ * thousands of port reads per report when the 8042 never responds, which
+ * livelocks the machine from inside the ISR -- so once a full mouse report
+ * fails to inject, latch the bridge off and stop trying. */
+static volatile BOOL g_8042_timeout_hit = FALSE;   //set whenever any 8042 wait below expires
+static volatile BOOL g_mouse_inject_dead = FALSE;  //latched on first failed report: skip all further mouse injects
 #if _LOG_ENABLE
 static void DBG_8042Timeout(const char* which)
 {
@@ -157,9 +162,9 @@ static void DBG_8042Timeout(const char* which)
 #else
 #define _8042_TIMEOUT(s)
 #endif
-#define WAIT_KEYBOARD_IN_EMPTY() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while((inp(0x64)&2)){ if(!--_kt){ _8042_TIMEOUT("IN_EMPTY"); break; } } }while(0)
-#define WAIT_KEYBOARD_OUT_EMPTY() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while((inp(0x64)&1)){ STI();NOP();NOP();NOP();CLI(); if(!--_kt){ _8042_TIMEOUT("OUT_EMPTY"); break; } } }while(0)//USB_IdleWait()
-#define WAIT_EKYBOARD_OUT_FULL() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while(!(inp(0x64)&1)){ if(!--_kt){ _8042_TIMEOUT("OUT_FULL"); break; } } }while(0)
+#define WAIT_KEYBOARD_IN_EMPTY() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while((inp(0x64)&2)){ if(!--_kt){ g_8042_timeout_hit = TRUE; _8042_TIMEOUT("IN_EMPTY"); break; } } }while(0)
+#define WAIT_KEYBOARD_OUT_EMPTY() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while((inp(0x64)&1)){ STI();NOP();NOP();NOP();CLI(); if(!--_kt){ g_8042_timeout_hit = TRUE; _8042_TIMEOUT("OUT_EMPTY"); break; } } }while(0)//USB_IdleWait()
+#define WAIT_EKYBOARD_OUT_FULL() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while(!(inp(0x64)&1)){ if(!--_kt){ g_8042_timeout_hit = TRUE; _8042_TIMEOUT("OUT_FULL"); break; } } }while(0)
 
 //keyboard device input processing
 static BOOL USB_HID_Keyboard_IsInputEmpty(const USB_HID_Data* data);
@@ -560,7 +565,11 @@ static void USB_HID_Mouse_GenerateSample(uint8_t byte)
 void USB_HID_Mouse_Finalizer(void* data)
 {
     USB_HID_Data* hiddata = (USB_HID_Data*)data;
-    
+
+    if(g_mouse_inject_dead) //8042 mouse channel proven unresponsive: bail before spinning the ISR
+        return;
+    g_8042_timeout_hit = FALSE;
+
     //https://wiki.osdev.org/Mouse_Input
     int status = (hiddata->Mouse.Button&0x7) | 0x08;
     status |= hiddata->Mouse.DX < 0 ? 0x10 : 0;
@@ -588,6 +597,12 @@ void USB_HID_Mouse_Finalizer(void* data)
     WAIT_KEYBOARD_IN_EMPTY();
 
     PIC_SetIRQMask(mask);
+
+    if(g_8042_timeout_hit)
+    {   //the 8042 never accepted/drained this report; it will not accept the next one either.
+        g_mouse_inject_dead = TRUE;
+        _LOG("8042 mouse inject unresponsive: disabling PS/2 mouse bridge\n");
+    }
 }
 
 static void USB_HID_InputCallback(HCD_Request* pRequest)

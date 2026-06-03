@@ -278,9 +278,7 @@ BOOL USB_InitController(uint8_t bus, uint8_t dev, uint8_t func, PCI_DEVICE* pPCI
 BOOL USB_InitDevice(HCD_HUB* pHub, uint8_t portIndex, uint16_t portStatus)
 {
     //early return
-    if(pHub->pHCI->bDevCount >= USB_MAX_HC_COUNT)
-        return FALSE;
-    if(USBT.DeviceCount >= USB_MAX_DEVICE_COUNT)
+    if(pHub->pHCI->bDevCount >= HCD_MAX_DEVICE_COUNT)
         return FALSE;
 
     USB_Device* pDevice = NULL;
@@ -289,6 +287,11 @@ BOOL USB_InitDevice(HCD_HUB* pHub, uint8_t portIndex, uint16_t portStatus)
     {
         if(!HCD_IS_DEVICE_VALID(&USBT.Devices[address].HCDDevice))
             break;
+    }
+    if(address >= USB_MAX_DEVICE_COUNT)
+    {   //pool full: refuse the device rather than index past Devices[]
+        _LOG("USB device pool full (%d): device at port %d not enumerated.\n", USB_MAX_DEVICE_COUNT, portIndex);
+        return FALSE;
     }
     pDevice = &USBT.Devices[address];
     address = (uint8_t)(address + 1); //1 based
