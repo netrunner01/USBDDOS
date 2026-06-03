@@ -11,6 +11,12 @@
 #include "USBDDOS/dbgutil.h"
 #include "USBDDOS/pic.h"
 
+/* Cap on the per-byte UART transmit-ready spin in DBG_Logv. ~tens of ms of
+ * ISA port reads on a Pentium-class CPU; far longer than a healthy UART needs
+ * at 9600 baud, short enough that a stalled UART can never hang the machine.
+ * Tunable. */
+#define DBG_SERIAL_SPIN_MAX 100000UL
+
 #if _LOG_ENABLE
 
 #if defined(__BC__) //BC always uses C++ to compile
@@ -148,10 +154,18 @@ void DBG_Logv(const char* fmt, va_list aptr)
      * VGA/INT-10h paths below, which keeps timing predictable on
      * USBDDOSP regression captures. */
     #if 1
+    /* Bounded transmit-holding-register-empty wait. An unbounded spin here can
+     * hard-hang the machine if the UART never drains (no receiver, hardware
+     * flow control, or a stalled capture host) -- and _LOG runs in interrupt
+     * context, so a stall freezes the driver. Cap the wait; if the UART will
+     * not accept the byte, drop the rest of the line. Losing debug output is
+     * always preferable to hanging. */
     outp(0x3F8+3, 0x03);
     for(int i = 0; i < len; ++i)
     {
-        while((inp(0x3F8+5)&0x20)==0);
+        unsigned long spin = DBG_SERIAL_SPIN_MAX;
+        while((inp(0x3F8+5)&0x20)==0)
+            if(!--spin) return;
         outp(0x3F8, (uint8_t)buf[i]);
     }
     return;

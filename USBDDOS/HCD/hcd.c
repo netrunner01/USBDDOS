@@ -58,6 +58,8 @@ BOOL HCD_InitDevice(HCD_HUB* pHub, HCD_Device* pDevice, uint8_t port, uint16_t p
     pDevice->pHCI = pHub->pHCI;
     pDevice->pHub = pHub;
     pDevice->bHubPort = port;
+    _LOG("HCD add device base=%08lx port=%d -> devcount=%d\n",
+        (unsigned long)pHub->pHCI->dwBaseAddress, port, pHub->pHCI->bDevCount);
     pDevice->bSpeed = portStatus&USB_PORT_SPEEDMASK;
     pDevice->pHCData = NULL;
     return pHub->pHCI->pHCDMethod->InitDevice(pDevice);

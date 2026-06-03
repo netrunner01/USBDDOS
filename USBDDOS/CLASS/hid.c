@@ -139,9 +139,27 @@ static uint8_t USB_HID_KEYBOARD_USAGE2SCANCODES[256*2] =
  * never trips on working hardware. On timeout the wait breaks and (DEBUG only)
  * logs which wait gave up. */
 #define KBD_8042_SPIN_MAX 20000UL
-#define WAIT_KEYBOARD_IN_EMPTY() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while((inp(0x64)&2)){ if(!--_kt){ _LOG("8042 timeout: IN_EMPTY\n"); break; } } }while(0)
-#define WAIT_KEYBOARD_OUT_EMPTY() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while((inp(0x64)&1)){ STI();NOP();NOP();NOP();CLI(); if(!--_kt){ _LOG("8042 timeout: OUT_EMPTY\n"); break; } } }while(0)//USB_IdleWait()
-#define WAIT_EKYBOARD_OUT_FULL() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while(!(inp(0x64)&1)){ if(!--_kt){ _LOG("8042 timeout: OUT_FULL\n"); break; } } }while(0)
+/* The 8042 inject can time out on every report on a controller with no PS/2
+ * mouse channel behind it; logging each one floods the serial console and,
+ * since this runs in interrupt context, starves the ISR. Log the first few,
+ * then suppress. */
+#if _LOG_ENABLE
+static void DBG_8042Timeout(const char* which)
+{
+    static unsigned long n = 0;
+    if(n < 3)
+        _LOG("8042 timeout: %s\n", which);
+    else if(n == 3)
+        _LOG("8042 timeout: further messages suppressed\n");
+    ++n;
+}
+#define _8042_TIMEOUT(s) DBG_8042Timeout(s)
+#else
+#define _8042_TIMEOUT(s)
+#endif
+#define WAIT_KEYBOARD_IN_EMPTY() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while((inp(0x64)&2)){ if(!--_kt){ _8042_TIMEOUT("IN_EMPTY"); break; } } }while(0)
+#define WAIT_KEYBOARD_OUT_EMPTY() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while((inp(0x64)&1)){ STI();NOP();NOP();NOP();CLI(); if(!--_kt){ _8042_TIMEOUT("OUT_EMPTY"); break; } } }while(0)//USB_IdleWait()
+#define WAIT_EKYBOARD_OUT_FULL() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while(!(inp(0x64)&1)){ if(!--_kt){ _8042_TIMEOUT("OUT_FULL"); break; } } }while(0)
 
 //keyboard device input processing
 static BOOL USB_HID_Keyboard_IsInputEmpty(const USB_HID_Data* data);

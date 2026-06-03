@@ -425,7 +425,9 @@ BOOL USB_RemoveDevice(USB_Device* pDevice)
     for(int e = 0; e < pDevice->bNumEndpoints; ++e)
         pDevice->HCDDevice.pHCI->pHCDMethod->RemoveEndPoint(&pDevice->HCDDevice, pDevice->pEndpoints[e]);
     pDevice->HCDDevice.pHCI->pHCDMethod->RemoveEndPoint(&pDevice->HCDDevice, pDevice->pDefaultControlEP); //HCD implementation probably do nothing but better do the call.
-    _LOG("USB Removing HCD device\n");
+    _LOG("USB Removing HCD device a%d base=%08lx port=%d devcount=%d\n",
+        pDevice->HCDDevice.bAddress, (unsigned long)pDevice->HCDDevice.pHCI->dwBaseAddress,
+        pDevice->HCDDevice.bHubPort, pDevice->HCDDevice.pHCI->bDevCount);
     HCD_RemoveDevice(&pDevice->HCDDevice);
 
     _LOG("USB Free device buffers\n");
@@ -501,6 +503,9 @@ uint8_t USB_SyncSendRequest(USB_Device* pDevice, USB_Request* pRequest, void* pB
 {
     USB_SyncCallbackResult result;
     result.Finished = FALSE;
+    _LOG("REQ a%d bmReq=%02x bReq=%02x wVal=%04x wIdx=%04x wLen=%d\n",
+        pDevice->HCDDevice.bAddress, pRequest->bmRequestType, pRequest->bRequest,
+        pRequest->wValue, pRequest->wIndex, pRequest->wLength);
     uint8_t error = USB_SendRequest(pDevice, pRequest, pBuffer, USB_Completion_SyncCallback, &result);
     if(error != 0)
     {
