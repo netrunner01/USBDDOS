@@ -139,18 +139,31 @@ static uint8_t USB_HID_KEYBOARD_USAGE2SCANCODES[256*2] =
  * never trips on working hardware. On timeout the wait breaks and (DEBUG only)
  * logs which wait gave up. */
 #define KBD_8042_SPIN_MAX 20000UL
-/* The 8042 inject times out whenever nothing is consuming the aux channel --
- * which is the NORMAL state until a PS/2 mouse driver (e.g. CuteMouse) is
- * loaded, and the permanent state on a machine whose aux port is disabled.
- * Logging each timeout floods the serial console, and the bounded waits
- * themselves cost hundreds of thousands of port reads per report from inside
- * the ISR. So: when a full report fails to inject, restore the controller and
- * SUSPEND the bridge, skipping reports cheaply, but retry a real inject every
- * Nth report and resume as soon as a consumer is draining the channel. */
-static volatile BOOL g_8042_timeout_hit = FALSE;        //set whenever any 8042 wait below expires
-static volatile BOOL g_mouse_inject_suspended = FALSE;  //set when a full report failed to inject (no consumer)
+/* Bridge health is judged at FINALIZER ENTRY, not inside the inject. An
+ * injected aux byte is only ever consumed after this ISR returns (the IRQ12
+ * reflection to the real-mode handler does not run during the in-ISR STI
+ * windows on a DPMI-over-V86 stack), so an in-ISR OUT_EMPTY wait expiring is
+ * the NORMAL outcome and distinguishes nothing. What does distinguish a live
+ * consumer from a dead channel is the state of the output buffer across the
+ * inter-report gap (~8-10ms), where consumption IS possible: if the previous
+ * report's aux byte (status 0x21: OBF set + aux-data flag) is still parked in
+ * the output buffer when the NEXT report arrives, nothing is reading the
+ * channel. After MOUSE_STUCK_ENTRIES_SUSPEND consecutive stuck entries the
+ * bridge restores the controller (drain stuck aux bytes, re-enable keyboard)
+ * and SUSPENDS: reports are then skipped at entry cost, with one real inject
+ * retried every MOUSE_INJECT_RETRY_INTERVAL reports; if that retry packet is
+ * gone by the following entry, a consumer has appeared and the bridge resumes.
+ * The per-byte OUT_EMPTY wait inside the inject is reduced to a short pacing
+ * bound (it cannot succeed in-ISR; see above) so a report never burns the full
+ * health-scale spin from interrupt context. */
+static volatile BOOL g_8042_timeout_hit = FALSE;        //set whenever a full-bound 8042 wait below expires (diagnostic)
+static volatile BOOL g_mouse_inject_suspended = FALSE;  //set when entry checks proved nothing consumes the aux channel
+static volatile BOOL g_mouse_retry_pending = FALSE;     //a retry report was injected; next entry decides resume vs stay
+static volatile uint8_t g_mouse_stuck_entries = 0;      //consecutive entries that found the previous aux byte unconsumed
 static volatile uint16_t g_mouse_inject_skip = 0;       //reports skipped while suspended, for periodic retry
 #define MOUSE_INJECT_RETRY_INTERVAL 32                  //attempt a real inject every Nth report while suspended
+#define MOUSE_STUCK_ENTRIES_SUSPEND 3                   //consecutive stuck entries before the bridge suspends
+#define KBD_8042_PACING_SPIN 256UL                      //token pacing for the in-ISR per-byte OUT_EMPTY (expected to expire)
 #if _LOG_ENABLE
 static void DBG_8042Timeout(const char* which)
 {
@@ -168,6 +181,8 @@ static void DBG_8042Timeout(const char* which)
 #define WAIT_KEYBOARD_IN_EMPTY() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while((inp(0x64)&2)){ if(!--_kt){ g_8042_timeout_hit = TRUE; _8042_TIMEOUT("IN_EMPTY"); break; } } }while(0)
 #define WAIT_KEYBOARD_OUT_EMPTY() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while((inp(0x64)&1)){ STI();NOP();NOP();NOP();CLI(); if(!--_kt){ g_8042_timeout_hit = TRUE; _8042_TIMEOUT("OUT_EMPTY"); break; } } }while(0)//USB_IdleWait()
 #define WAIT_EKYBOARD_OUT_FULL() do{ unsigned long _kt=KBD_8042_SPIN_MAX; while(!(inp(0x64)&1)){ if(!--_kt){ g_8042_timeout_hit = TRUE; _8042_TIMEOUT("OUT_FULL"); break; } } }while(0)
+//token pacing only: in-ISR consumption never happens (see design note above), so this is expected to expire and neither flags nor logs
+#define WAIT_MOUSE_OUT_PACING() do{ unsigned long _kt=KBD_8042_PACING_SPIN; while((inp(0x64)&1)){ STI();NOP();NOP();NOP();CLI(); if(!--_kt) break; } }while(0)
 
 //keyboard device input processing
 static BOOL USB_HID_Keyboard_IsInputEmpty(const USB_HID_Data* data);
@@ -562,20 +577,87 @@ static void USB_HID_Mouse_GenerateSample(uint8_t byte)
 
     WAIT_EKYBOARD_OUT_FULL(); //!important: wait until data is available, especially for fast CPUs.
 
-    WAIT_KEYBOARD_OUT_EMPTY(); //idle wait mouse irq handler
+    WAIT_MOUSE_OUT_PACING(); //pacing only: the byte is consumed after this ISR returns, never inside it
+}
+
+static void USB_HID_Mouse_8042Restore(void)
+{   //a stuck aux byte in the output buffer can block keyboard delivery, leaving
+    //the console dead. Discard AUX bytes only (a keyboard byte in OBF belongs
+    //to IRQ1 and must not be eaten), then re-enable the keyboard port in case
+    //an earlier 0xAE was not accepted by a wedged controller.
+    unsigned long drain;
+    unsigned long settle;
+    uint8_t st;
+    for(drain = 0; drain < 16; ++drain)
+    {
+        settle = 64; //allow a queued byte a moment to reach the output buffer
+        while(!((st = (uint8_t)inp(0x64))&1) && --settle);
+        if(!(st&1))
+            break;   //output buffer stayed empty: drained
+        if(!(st&0x20))
+            break;   //keyboard data, not aux: leave it for IRQ1
+        (void)inp(0x60); //discard the stuck aux byte: nothing is reading it
+    }
+    WAIT_KEYBOARD_IN_EMPTY();
+    outp(0x64, 0xAE); //(re-)enable keyboard port
+    WAIT_KEYBOARD_IN_EMPTY();
 }
 
 void USB_HID_Mouse_Finalizer(void* data)
 {
     USB_HID_Data* hiddata = (USB_HID_Data*)data;
 
+    //ENTRY-OBF health check (see design note above the WAIT_ macros): the state
+    //of the aux output buffer ACROSS the inter-report gap is the only signal
+    //that separates "a consumer drains this channel" from "nothing ever will".
+    uint8_t entry_status = (uint8_t)inp(0x64);
+    BOOL aux_stuck = ((entry_status & 0x21) == 0x21);
+
     if(g_mouse_inject_suspended)
-    {   //no consumer last time: skip cheaply, but retry a real inject every Nth report
-        if(++g_mouse_inject_skip < MOUSE_INJECT_RETRY_INTERVAL)
-            return;
-        g_mouse_inject_skip = 0;
+    {
+        if(g_mouse_retry_pending)
+        {   //a retry report was injected last time; the gap has passed - decide
+            g_mouse_retry_pending = FALSE;
+            if(!aux_stuck)
+            {   //the retry packet was consumed: a mouse driver is draining the channel
+                g_mouse_inject_suspended = FALSE;
+                g_mouse_stuck_entries = 0;
+                _LOG("PS/2 mouse bridge resumed\n");
+                //fall through and inject this report normally
+            }
+            else
+            {   //retry not consumed: stay suspended, keep the controller sane
+                USB_HID_Mouse_8042Restore();
+                return;
+            }
+        }
+        else
+        {
+            if(++g_mouse_inject_skip < MOUSE_INJECT_RETRY_INTERVAL)
+                return; //skip cheaply: one port read per report
+            g_mouse_inject_skip = 0;
+            g_mouse_retry_pending = TRUE;
+            //fall through: inject one real report as the retry probe
+        }
     }
-    g_8042_timeout_hit = FALSE;
+    else
+    {
+        if(aux_stuck)
+        {   //previous report's byte never consumed across the gap. Do NOT stack
+            //another report onto it (a 1-deep 8042 would garble both).
+            if(++g_mouse_stuck_entries >= MOUSE_STUCK_ENTRIES_SUSPEND)
+            {
+                USB_HID_Mouse_8042Restore();
+                g_mouse_inject_suspended = TRUE;
+                g_mouse_retry_pending = FALSE;
+                g_mouse_inject_skip = 0;
+                g_mouse_stuck_entries = 0;
+                _LOG("8042 mouse inject not consumed: suspending PS/2 mouse bridge\n");
+            }
+            return;
+        }
+        g_mouse_stuck_entries = 0;
+    }
 
     //https://wiki.osdev.org/Mouse_Input
     int status = (hiddata->Mouse.Button&0x7) | 0x08;
@@ -604,35 +686,6 @@ void USB_HID_Mouse_Finalizer(void* data)
     WAIT_KEYBOARD_IN_EMPTY();
 
     PIC_SetIRQMask(mask);
-
-    if(g_8042_timeout_hit)
-    {   //nothing consumed this report. Put the controller back in a sane state (a stuck
-        //aux byte in the output buffer can block keyboard delivery, leaving the console
-        //dead) and suspend the bridge until a consumer appears.
-        unsigned long drain;
-        unsigned long settle;
-        for(drain = 0; drain < 16; ++drain)
-        {
-            settle = 64; //allow a queued byte a moment to reach the output buffer
-            while(!(inp(0x64)&1) && --settle);
-            if(!(inp(0x64)&1))
-                break;
-            (void)inp(0x60); //discard the stuck byte: nothing is reading it
-        }
-        outp(0x64, 0xAE); //re-enable the keyboard port in case the earlier 0xAE was not accepted
-        WAIT_KEYBOARD_IN_EMPTY();
-        if(!g_mouse_inject_suspended)
-        {
-            g_mouse_inject_suspended = TRUE;
-            g_mouse_inject_skip = 0;
-            _LOG("8042 mouse inject not consumed: suspending PS/2 mouse bridge\n");
-        }
-    }
-    else if(g_mouse_inject_suspended)
-    {   //a consumer is draining the aux channel again (mouse driver loaded): resume
-        g_mouse_inject_suspended = FALSE;
-        _LOG("PS/2 mouse bridge resumed\n");
-    }
 }
 
 static void USB_HID_InputCallback(HCD_Request* pRequest)
