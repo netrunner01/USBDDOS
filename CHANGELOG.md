@@ -11,6 +11,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/)
 for the fork-side suffix.
 
+## [Unreleased]
+
+### Fixed
+
+- **Enumeration hang on NAK-forever devices.** Control transfers now use a
+  bounded wait (2000 ms) with a UHCI abort path that removes the transfer
+  from the schedule and logs the controller state, instead of spinning
+  indefinitely on a device that never responds. Field-validated on an IBM
+  300GL docking station whose hub ports host devices that NAK all string
+  descriptor requests (Issue #2): seven aborts across one boot, enumeration
+  and disk access continued normally.
+- **Device-pool overflow on the 5th concurrent device.** The free-slot scan
+  in `USB_InitDevice` had no bounds check and, with all slots taken, wrote
+  one element past `Devices[]`, corrupting an adjacent function-pointer
+  table and crashing (GP fault) when a docking station's hubs pushed the
+  device count past the pool size. The scan is now bounds-guarded (a full
+  pool refuses enumeration with a log line), the 16-bit build's pool is
+  raised from 4 to 8 devices (~576 bytes resident), and a guard comparing
+  against the wrong constant was corrected. Field-validated on the same
+  dock: `devcount=5` reached twice in one boot, both handled cleanly.
+
 ## [1.0.0-alpha.2] — 2026-05-15
 
 **This is a housekeeping release.** No new code, no functional
