@@ -600,7 +600,22 @@ void USB_HID_Mouse_Finalizer(void* data)
 
     if(g_8042_timeout_hit)
     {   //the 8042 never accepted/drained this report; it will not accept the next one either.
+        //Latch the bridge off, then put the controller back in a sane state: on a machine
+        //with no aux consumer, an injected byte can sit in the output buffer forever and
+        //block keyboard delivery, leaving the console dead.
+        unsigned long drain;
+        unsigned long settle;
         g_mouse_inject_dead = TRUE;
+        for(drain = 0; drain < 16; ++drain)
+        {
+            settle = 64; //allow a queued byte a moment to reach the output buffer
+            while(!(inp(0x64)&1) && --settle);
+            if(!(inp(0x64)&1))
+                break;
+            (void)inp(0x60); //discard the stuck byte: nothing on this machine will read it
+        }
+        outp(0x64, 0xAE); //re-enable the keyboard port in case the earlier 0xAE was not accepted
+        WAIT_KEYBOARD_IN_EMPTY();
         _LOG("8042 mouse inject unresponsive: disabling PS/2 mouse bridge\n");
     }
 }
