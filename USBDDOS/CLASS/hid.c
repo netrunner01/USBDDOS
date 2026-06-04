@@ -139,15 +139,18 @@ static uint8_t USB_HID_KEYBOARD_USAGE2SCANCODES[256*2] =
  * never trips on working hardware. On timeout the wait breaks and (DEBUG only)
  * logs which wait gave up. */
 #define KBD_8042_SPIN_MAX 20000UL
-/* The 8042 inject can time out on every report on a controller with no PS/2
- * mouse channel behind it; logging each one floods the serial console and,
- * since this runs in interrupt context, starves the ISR. Log the first few,
- * then suppress. Worse, the bounded waits themselves cost hundreds of
- * thousands of port reads per report when the 8042 never responds, which
- * livelocks the machine from inside the ISR -- so once a full mouse report
- * fails to inject, latch the bridge off and stop trying. */
-static volatile BOOL g_8042_timeout_hit = FALSE;   //set whenever any 8042 wait below expires
-static volatile BOOL g_mouse_inject_dead = FALSE;  //latched on first failed report: skip all further mouse injects
+/* The 8042 inject times out whenever nothing is consuming the aux channel --
+ * which is the NORMAL state until a PS/2 mouse driver (e.g. CuteMouse) is
+ * loaded, and the permanent state on a machine whose aux port is disabled.
+ * Logging each timeout floods the serial console, and the bounded waits
+ * themselves cost hundreds of thousands of port reads per report from inside
+ * the ISR. So: when a full report fails to inject, restore the controller and
+ * SUSPEND the bridge, skipping reports cheaply, but retry a real inject every
+ * Nth report and resume as soon as a consumer is draining the channel. */
+static volatile BOOL g_8042_timeout_hit = FALSE;        //set whenever any 8042 wait below expires
+static volatile BOOL g_mouse_inject_suspended = FALSE;  //set when a full report failed to inject (no consumer)
+static volatile uint16_t g_mouse_inject_skip = 0;       //reports skipped while suspended, for periodic retry
+#define MOUSE_INJECT_RETRY_INTERVAL 32                  //attempt a real inject every Nth report while suspended
 #if _LOG_ENABLE
 static void DBG_8042Timeout(const char* which)
 {
@@ -566,8 +569,12 @@ void USB_HID_Mouse_Finalizer(void* data)
 {
     USB_HID_Data* hiddata = (USB_HID_Data*)data;
 
-    if(g_mouse_inject_dead) //8042 mouse channel proven unresponsive: bail before spinning the ISR
-        return;
+    if(g_mouse_inject_suspended)
+    {   //no consumer last time: skip cheaply, but retry a real inject every Nth report
+        if(++g_mouse_inject_skip < MOUSE_INJECT_RETRY_INTERVAL)
+            return;
+        g_mouse_inject_skip = 0;
+    }
     g_8042_timeout_hit = FALSE;
 
     //https://wiki.osdev.org/Mouse_Input
@@ -599,24 +606,32 @@ void USB_HID_Mouse_Finalizer(void* data)
     PIC_SetIRQMask(mask);
 
     if(g_8042_timeout_hit)
-    {   //the 8042 never accepted/drained this report; it will not accept the next one either.
-        //Latch the bridge off, then put the controller back in a sane state: on a machine
-        //with no aux consumer, an injected byte can sit in the output buffer forever and
-        //block keyboard delivery, leaving the console dead.
+    {   //nothing consumed this report. Put the controller back in a sane state (a stuck
+        //aux byte in the output buffer can block keyboard delivery, leaving the console
+        //dead) and suspend the bridge until a consumer appears.
         unsigned long drain;
         unsigned long settle;
-        g_mouse_inject_dead = TRUE;
         for(drain = 0; drain < 16; ++drain)
         {
             settle = 64; //allow a queued byte a moment to reach the output buffer
             while(!(inp(0x64)&1) && --settle);
             if(!(inp(0x64)&1))
                 break;
-            (void)inp(0x60); //discard the stuck byte: nothing on this machine will read it
+            (void)inp(0x60); //discard the stuck byte: nothing is reading it
         }
         outp(0x64, 0xAE); //re-enable the keyboard port in case the earlier 0xAE was not accepted
         WAIT_KEYBOARD_IN_EMPTY();
-        _LOG("8042 mouse inject unresponsive: disabling PS/2 mouse bridge\n");
+        if(!g_mouse_inject_suspended)
+        {
+            g_mouse_inject_suspended = TRUE;
+            g_mouse_inject_skip = 0;
+            _LOG("8042 mouse inject not consumed: suspending PS/2 mouse bridge\n");
+        }
+    }
+    else if(g_mouse_inject_suspended)
+    {   //a consumer is draining the aux channel again (mouse driver loaded): resume
+        g_mouse_inject_suspended = FALSE;
+        _LOG("PS/2 mouse bridge resumed\n");
     }
 }
 
