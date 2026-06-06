@@ -163,6 +163,156 @@ static volatile uint8_t g_mouse_stuck_entries = 0;      //consecutive entries th
 static volatile uint16_t g_mouse_inject_skip = 0;       //reports skipped while suspended, for periodic retry
 #define MOUSE_INJECT_RETRY_INTERVAL 32                  //attempt a real inject every Nth report while suspended
 #define MOUSE_STUCK_ENTRIES_SUSPEND 3                   //consecutive stuck entries before the bridge suspends
+
+/* INT 15h/C2xx PS/2 pointing-device emulation
+ *
+ * The 8042 fake-input bridge above can only ride alongside a real PS/2 mouse:
+ * it injects data bytes but answers no device commands, so an INT15-based
+ * mouse driver (CuteMouse) probing the aux port finds no device when none is
+ * physically present, and an IRQ12-driven consumer can never be fed from the
+ * USB ISR anyway (the nested IRQ12 must be deferred for mode-switch safety,
+ * and being edge-triggered it is then lost - see DPMI_HWIRQHandlerInternal).
+ *
+ * Emulating the BIOS INT 15h AX=C2xx pointing-device services removes the
+ * 8042 and IRQ12 from the path entirely: the mouse driver registers a far
+ * handler via AX=C207h and we call that handler directly with each USB
+ * report. Per RBIL (and verified against the CuteMouse 2.1 source), the
+ * handler is far-called with four words pushed - status, X, Y, 0 - where
+ * X/Y are the raw packet bytes zero-extended (sign carried in the status
+ * byte), the handler far-returns without popping, and the caller cleans up.
+ *
+ * The far call runs through a tiny real-mode thunk. It cannot live in this
+ * image's data segment: the 16-bit build keeps zero conventional paragraphs
+ * at TSR and runs from its himem copy, so the thunk is placed in a DOS
+ * memory block (owned by our PSP, survives TSR) and patched per call via
+ * linear stores. Calling down to the registered V86 handler from the USB
+ * ISR uses the same DPMI_CallRealModeIRET machinery as every reflected
+ * hardware interrupt, and generates no hardware IRQ of its own. */
+static DPMI_REG          HID_INT15Reg;                 //RMCB-captured caller registers
+static uint32_t          HID_INT15_OldVec = 0;         //previous IVT[15h], chained for non-C2 calls
+static volatile uint32_t g_ps2emu_handler = 0;         //C207 handler (seg<<16|off), 0 = none
+static volatile uint8_t  g_ps2emu_enabled = 0;         //C200 device-enable state
+static uint32_t          HID_PS2ThunkLinear = 0;       //linear addr of the RM call thunk (0 = emu not installed)
+static uint16_t          HID_PS2ThunkSeg = 0;
+
+//thunk byte layout (21 bytes), immediates patched at delivery / C207:
+//  +0  68 ss ss        push status
+//  +3  68 xx xx        push X (zero-extended packet byte)
+//  +6  68 yy yy        push Y (zero-extended packet byte)
+//  +9  68 00 00        push 0
+//  +12 9A oo oo ss ss  call far handler
+//  +17 83 C4 08        add sp,8
+//  +20 CF              iret  (invoked via DPMI_CallRealModeIRET)
+static const uint8_t HID_PS2ThunkTemplate[21] = {
+    0x68,0,0, 0x68,0,0, 0x68,0,0, 0x68,0,0,
+    0x9A,0,0,0,0, 0x83,0xC4,0x08, 0xCF };
+
+static void USB_HID_INT15Handler(void)
+{
+    DPMI_REG* r = &HID_INT15Reg;
+    if(r->h.ah == 0xC2)
+    {
+        uint8_t err = 0; //00522 status: 0=ok,1=invalid function,2=invalid input
+        switch(r->h.al)
+        {
+        case 0x00: //enable/disable, BH=state
+            if(r->h.bh > 1) { err = 2; break; }
+            g_ps2emu_enabled = r->h.bh;
+            break;
+        case 0x01: //reset: returns BH=device ID, BL=AAh; device left disabled
+            g_ps2emu_enabled = 0;
+            r->h.bh = 0x00; //standard mouse
+            r->h.bl = 0xAA;
+            break;
+        case 0x02: err = (uint8_t)(r->h.bh > 6 ? 2 : 0); break; //sample rate index
+        case 0x03: err = (uint8_t)(r->h.bh > 3 ? 2 : 0); break; //resolution
+        case 0x04: r->h.bh = 0x00; break;                       //get type: standard mouse
+        case 0x05: //initialize, BH=data package size. Only the plain 3-byte
+                   //protocol is emulated; wheel-probe sizes fail with
+                   //"invalid input" so the driver falls back to 3-byte mode.
+            if(r->h.bh != 3) { err = 2; break; }
+            g_ps2emu_enabled = 0;
+            break;
+        case 0x06: //extended: 0=status, 1/2=scaling
+            if(r->h.bh == 0) { r->h.bl = 0x00; r->h.cl = 0x02; r->h.dl = 100; }
+            else if(r->h.bh > 2) err = 2;
+            break;
+        case 0x07: //set device handler, ES:BX (0:0 cancels)
+            g_ps2emu_handler = ((uint32_t)r->w.es << 16) | r->w.bx;
+            if(HID_PS2ThunkLinear)
+            {
+                DPMI_StoreW(HID_PS2ThunkLinear + 13, r->w.bx);
+                DPMI_StoreW(HID_PS2ThunkLinear + 15, r->w.es);
+            }
+            break;
+        default:   //C208/C209 raw pointer-port access: not emulated
+            err = 1;
+            break;
+        }
+        r->h.ah = err;
+        if(err) r->w.flags = (uint16_t)(r->w.flags | 1u);  //CF set
+        else    r->w.flags = (uint16_t)(r->w.flags & ~1u); //CF clear
+        return; //RMCB IRETs back to the caller with these registers
+    }
+
+    //not a pointing-device call: chain to the previous INT 15h handler and
+    //hand its results back to the caller.
+    {
+        DPMI_REG r2 = *r;
+        r2.w.cs = (uint16_t)(HID_INT15_OldVec >> 16);
+        r2.w.ip = (uint16_t)(HID_INT15_OldVec & 0xFFFF);
+        r2.w.ss = r2.w.sp = 0;
+        DPMI_CallRealModeIRET(&r2);
+        r->d.eax = r2.d.eax; r->d.ebx = r2.d.ebx;
+        r->d.ecx = r2.d.ecx; r->d.edx = r2.d.edx;
+        r->d.esi = r2.d.esi; r->d.edi = r2.d.edi;
+        r->d.ebp = r2.d.ebp;
+        r->w.es = r2.w.es; r->w.ds = r2.w.ds;
+        r->w.fs = r2.w.fs; r->w.gs = r2.w.gs;
+        r->w.flags = r2.w.flags;
+    }
+}
+
+static BOOL USB_HID_PS2Emu_Install(void)
+{
+    if(HID_PS2ThunkLinear) //already installed
+        return TRUE;
+
+    //DOS block for the RM thunk: owned by our PSP, survives TSR (the program
+    //image's own conventional memory does not - keep size is 0).
+    DPMI_REG r = {0};
+    r.h.ah = 0x48;
+    r.w.bx = 2; //2 paragraphs
+    DPMI_CallRealModeINT(0x21, &r);
+    if(r.w.flags & 1u)
+    {
+        _LOG("PS2EMU: DOS alloc failed\n");
+        return FALSE;
+    }
+    HID_PS2ThunkSeg = r.w.ax;
+    HID_PS2ThunkLinear = ((uint32_t)HID_PS2ThunkSeg) << 4;
+    for(int i = 0; i < (int)sizeof(HID_PS2ThunkTemplate); ++i)
+        DPMI_StoreB(HID_PS2ThunkLinear + (uint32_t)i, HID_PS2ThunkTemplate[i]);
+
+    uint32_t rmcb = DPMI_AllocateRMCB_IRET(&USB_HID_INT15Handler, &HID_INT15Reg);
+    if(rmcb == 0)
+    {
+        _LOG("PS2EMU: RMCB alloc failed\n");
+        HID_PS2ThunkLinear = 0;
+        return FALSE;
+    }
+
+    CLI();
+    HID_INT15_OldVec = DPMI_LoadD(0x15ul * 4);
+    DPMI_StoreD(0x15ul * 4, rmcb);
+    //BIOS equipment word @0040:0010 bit 2: PS/2 pointing device installed.
+    //INT15-based drivers check this before probing.
+    DPMI_StoreW(0x410, (uint16_t)(DPMI_LoadW(0x410) | 0x0004));
+    STI();
+    _LOG("PS2EMU: INT15h C2xx pointing-device emulation installed\n");
+    return TRUE;
+}
+
 #define KBD_8042_PACING_SPIN 256UL                      //token pacing for the in-ISR per-byte OUT_EMPTY (expected to expire)
 #if _LOG_ENABLE
 static void DBG_8042Timeout(const char* which)
@@ -329,6 +479,8 @@ BOOL USB_HID_DOS_Install()
                     if(pDriverData->Interface[i].Descriptors && pDriverData->Interface[i].pDataEP[HCD_TXR])
                     {
                         printf("Found USB %s: %s %s\n", i == USB_HID_KEYBOARD ? "keyboard" : "mouse", pDevice->sManufacture, pDevice->sProduct);
+                        if(i == USB_HID_MOUSE)
+                            USB_HID_PS2Emu_Install(); //once; idempotent
                         USB_Transfer(pDevice, pDriverData->Interface[i].pDataEP[HCD_TXR], pDriverData->Interface[i].Data[0].Buffer, sizeof(USB_HID_Data), &USB_HID_InputCallback, (void*)i);
                     }
                 }
@@ -606,6 +758,26 @@ static void USB_HID_Mouse_8042Restore(void)
 void USB_HID_Mouse_Finalizer(void* data)
 {
     USB_HID_Data* hiddata = (USB_HID_Data*)data;
+
+    //INT15h/C2xx delivery: if a pointing-device handler is registered with our
+    //emulation, far-call it with this report and skip the 8042 entirely - no
+    //controller writes, no IRQ12. Status byte and Y-axis conversion are
+    //identical to the 8042 path below (PS/2 Y is positive-up, HID DY is
+    //positive-down).
+    if(g_ps2emu_handler && g_ps2emu_enabled)
+    {
+        uint8_t st = (uint8_t)(((hiddata->Mouse.Button&0x7) | 0x08)
+                   | (hiddata->Mouse.DX < 0 ? 0x10 : 0)
+                   | (hiddata->Mouse.DY > 0 ? 0x20 : 0));
+        DPMI_REG tr = {0};
+        DPMI_StoreW(HID_PS2ThunkLinear + 1, (uint16_t)st);
+        DPMI_StoreW(HID_PS2ThunkLinear + 4, (uint16_t)(uint8_t)hiddata->Mouse.DX);
+        DPMI_StoreW(HID_PS2ThunkLinear + 7, (uint16_t)(uint8_t)(-hiddata->Mouse.DY));
+        tr.w.cs = HID_PS2ThunkSeg;
+        tr.w.ip = 0;
+        DPMI_CallRealModeIRET(&tr);
+        return;
+    }
 
     //ENTRY-OBF health check (see design note above the WAIT_ macros): the state
     //of the aux output buffer ACROSS the inter-report gap is the only signal
