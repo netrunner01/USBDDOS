@@ -1,5 +1,5 @@
 # USBDDOS fork — status, TODO, and bug list
-Updated: 2026-07-17 (housekeeping: PRs #40-42 confirmed MERGED; 5 stale merged source branches deleted from origin; session deliverables moved out of repo root; v2-line master-sync decided = Option A, cherry-picked #42 DPMI + #36 OOM + CHANGELOG onto release line, unpushed pending build-verify). Prior checkpoint 2026-06-06.
+Updated: 2026-07-17 (doc-drift fix: release line is ahead of origin `d39f839` by the 5-commit named stack below plus this true-up commit; the earlier "+4" miscounted by omitting the doc-update commit that carried it. Housekeeping: PRs #40-42 confirmed MERGED; 5 stale merged source branches deleted from origin; session deliverables moved out of repo root; v2-line master-sync decided = Option A, cherry-picked #42 DPMI + #36 OOM + CHANGELOG onto release line, unpushed pending build-verify). Prior checkpoint 2026-06-06.
 
 ## Housekeeping done 2026-07-17
 - **PRs #40/#41/#42 all MERGED** (verified via GitHub API). Their `pr/*`
@@ -39,7 +39,7 @@ Updated: 2026-07-17 (housekeeping: PRs #40-42 confirmed MERGED; 5 stale merged s
 
 | Branch | Head | Contents |
 |---|---|---|
-| `fix/msc-transport-rewrite` (release line) | `776a7b7` (local; origin at `d39f839`, **+4 unpushed**) | P-series + `0c2fa7d` + **control-timeout** (`b178198`) + **device-pool fix** (`5d85eab`) + gitignore (`d39f839`) + **cherry-picked #42 DPMI** (`865a254`) + **#36 OOM** (`10a7125`) + CHANGELOG (`abd9683`) + status-doc tracking (`776a7b7`) — unpushed 4 pending build-verify |
+| `fix/msc-transport-rewrite` (release line) | local tip (origin anchored at `d39f839`; unpushed stack = the 5 named commits below + this doc-drift-fix commit) | P-series + `0c2fa7d` + **control-timeout** (`b178198`) + **device-pool fix** (`5d85eab`) + gitignore (`d39f839`) + **cherry-picked #42 DPMI** (`865a254`) + **#36 OOM** (`10a7125`) + CHANGELOG (`abd9683`) + status-doc tracking (`776a7b7`) + branch-table true-up (`2318013`) — all unpushed pending build-verify. (Count is fragile: every status-doc commit adds one more unpushed commit, so track the origin anchor `d39f839` + named stack, not a raw integer.) |
 | `dbg/combined-trace` | `088a15c` | release base + traces + 8042 bridge (`4df062e`) + **DPMI nested-IRQ fix** (`fd29498`, = PR #42, merged) + **INT15h/C2xx PS/2 emulation** (`088a15c`) — awaiting metal Test G before landing on release line |
 | ~~`pr/control-timeout`~~ | — | **PR #40 MERGED**; branch deleted |
 | ~~`pr/device-pool`~~ | — | **PR #41 MERGED**; branch deleted |
