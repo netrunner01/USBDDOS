@@ -31,6 +31,26 @@ for the fork-side suffix.
   raised from 4 to 8 devices (~576 bytes resident), and a guard comparing
   against the wrong constant was corrected. Field-validated on the same
   dock: `devcount=5` reached twice in one boot, both handled cleanly.
+- **GP fault from a nested hardware IRQ during the V86 mode switch.** When a
+  second hardware interrupt (e.g. IRQ12 once the PS/2 aux channel is armed)
+  fired while the USB IRQ was mid-service, it re-entered the non-reentrant
+  VCPI/V86 mode switch — whose single client-save area is not reentrant — and
+  the outer V86 frame (COMMAND.COM) was resumed as protected-mode, faulting
+  in DOS's own code and deadlooping the monitor. Nested hardware IRQs are now
+  deferred: masked and specifically-EOI'd inside `DPMI_HWIRQHandlerInternal`
+  (new `PIC_SendSpecificEOI`), recorded, and re-delivered by unmasking once
+  the outer service completes. Field-validated multi-run on the IBM 300GL: a
+  deterministic reproducer went from freeze-every-time to zero exceptions.
+  Cherry-picked from upstream (merged as PR #42).
+- **OOM hardening: `DPMI_DMAMalloc` NULL returns handled at every callsite.**
+  `DPMI_DMAMalloc` is fixed at source to stop doing offset arithmetic on a
+  failed `malloc` (which produced a bogus non-NULL pointer). Ten allocation
+  callsites in `hub.c`, `ohci.c`, `uhci.c`, `ehci.c`, and `usb.c` — previously
+  guarded only by `assert()` (a no-op in release builds) or an unchecked
+  dereference — now check for NULL and bail gracefully with a `_LOG` line
+  instead of crashing on an out-of-memory condition. The endpoint-config path
+  additionally skips just the failed endpoint rather than aborting the device.
+  Cherry-picked from upstream (merged as PR #36).
 
 ## [1.0.0-alpha.2] — 2026-05-15
 
