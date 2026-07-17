@@ -1,2 +1,9 @@
 .vscode
 Make/output/*.*
+*.bundle
+*.md
+*.zip
+!README.md
+!readme.md
+!CHANGELOG.md
+!changelog.md
