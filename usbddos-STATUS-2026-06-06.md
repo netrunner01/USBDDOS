@@ -12,7 +12,9 @@ Updated: 2026-07-17 (housekeeping: PRs #40-42 confirmed MERGED; 5 stale merged s
   `master`, `dbg/combined-trace`, `fix/msc-transport-rewrite`, `release/v1.0.0-alpha.2.1`.
 - **Moved session deliverables out of repo root** to
   `../USBDDOS-session-deliverables/`: the BAR-0 `.patch` (redundant w/ `0c2fa7d`),
-  `UDDCOMB6/7-map.txt`, `batch-pr.sh`, `batch-pr2.sh`. Repo root now clean.
+  `UDDCOMB6/7-map.txt`, `batch-pr.sh`, `batch-pr2.sh`, and the 995 KB MSC-rewrite
+  `.bundle`. Repo root now clear of loose artifacts (only remaining ignored
+  files = the 2 tester zips in `rel-verify/`, left intentionally).
 - **v2-line master-sync DECIDED: Option A (cherry-pick, stay diverged).**
   The v2 line and upstream deliberately diverged at PR #32 and evolved in
   parallel; a full merge/rebase would conflict across 6 files (msc.c transport
@@ -37,7 +39,7 @@ Updated: 2026-07-17 (housekeeping: PRs #40-42 confirmed MERGED; 5 stale merged s
 
 | Branch | Head | Contents |
 |---|---|---|
-| `fix/msc-transport-rewrite` (release line) | `abd9683` (local; origin at `d39f839`, +3 unpushed) | P-series + `0c2fa7d` + **control-timeout** (`b178198`) + **device-pool fix** (`5d85eab`) + gitignore (`d39f839`) + **cherry-picked #42 DPMI** (`865a254`) + **#36 OOM** (`10a7125`) + CHANGELOG (`abd9683`) — unpushed 3 pending build-verify |
+| `fix/msc-transport-rewrite` (release line) | `776a7b7` (local; origin at `d39f839`, **+4 unpushed**) | P-series + `0c2fa7d` + **control-timeout** (`b178198`) + **device-pool fix** (`5d85eab`) + gitignore (`d39f839`) + **cherry-picked #42 DPMI** (`865a254`) + **#36 OOM** (`10a7125`) + CHANGELOG (`abd9683`) + status-doc tracking (`776a7b7`) — unpushed 4 pending build-verify |
 | `dbg/combined-trace` | `088a15c` | release base + traces + 8042 bridge (`4df062e`) + **DPMI nested-IRQ fix** (`fd29498`, = PR #42, merged) + **INT15h/C2xx PS/2 emulation** (`088a15c`) — awaiting metal Test G before landing on release line |
 | ~~`pr/control-timeout`~~ | — | **PR #40 MERGED**; branch deleted |
 | ~~`pr/device-pool`~~ | — | **PR #41 MERGED**; branch deleted |
