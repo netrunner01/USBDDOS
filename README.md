@@ -399,6 +399,17 @@ it has a builtin 16 bit protected mode functions which will enter protected mode
 To play games with a USB mouse, USBDDOSP.EXE is recommended, which also need a DIMI host (i.e. HDPMI.exe).~~ Latest tests with 1.0fix2 shows that USBDDOS is more stable than USBDDOSP.  
 Like [Bret Johnson's driver](https://bretjohnson.us/), USBDDOSP/USBDDOS need CuteMouse to work for USB mouse. 
 
+> **Known limitation — the direct (No-VCPI) protected-mode switch on some
+> 486-class hardware.** When no VCPI/EMM provider is loaded, USBDDOS uses its
+> builtin direct real-mode→protected-mode switch. On certain real 486-class
+> machines this can lock the machine hard during early init (power cycle
+> required). Reproduced on an AMD Am5x86 / UMC UM8881F system with an Award
+> BIOS; it does not occur under emulation, nor on the VCPI path, and disabling
+> the CPU L1 cache did not clear it — consistent with a cache/prefetch coherency
+> issue in the self-modifying switch. **Workaround:** load a VCPI provider
+> (EMM386/JEMM386/QEMM386, e.g. `EMM386.EXE NOEMS` after HIMEM.SYS with
+> `DOS=HIGH,UMB`) so the VCPI path is taken. Tracked in crazii/USBDDOS#43.
+
 # Tips
 USBDDOSP doesn't need HDPMI32i unless you want Retrowave support, normal HDPMI32/CWSDPMI is recommended, unless you want it cope with SBEMU.
 

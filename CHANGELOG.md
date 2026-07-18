@@ -13,6 +13,18 @@ for the fork-side suffix.
 
 ## [Unreleased]
 
+### Documentation
+
+- **Known limitation: no-VCPI direct switch can lock on some 486-class
+  hardware.** Documented in the README (near the protected-mode / DPMI notes):
+  on certain real 486-class machines (reproduced on AMD Am5x86 / UMC UM8881F, Award BIOS)
+  the direct real-mode-to-protected-mode switch used when no VCPI provider is
+  loaded can lock the machine during early init. It does not reproduce under
+  emulation or on the VCPI path; disabling L1 cache did not clear it. Cause is
+  uncharacterised but consistent with a cache/prefetch coherency issue in the
+  self-modifying switch. Workaround: load EMM386/JEMM386 (e.g. `NOEMS`) so the
+  VCPI path is taken. Tracked in crazii/USBDDOS#43.
+
 ### Fixed
 
 - **Enumeration hang on NAK-forever devices.** Control transfers now use a
