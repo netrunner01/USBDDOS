@@ -1,5 +1,52 @@
 # USBDDOS fork — status, TODO, and bug list
-Updated: 2026-07-17 (doc-drift fix: release line is ahead of origin `d39f839` by the 5-commit named stack below plus this true-up commit; the earlier "+4" miscounted by omitting the doc-update commit that carried it. Housekeeping: PRs #40-42 confirmed MERGED; 5 stale merged source branches deleted from origin; session deliverables moved out of repo root; v2-line master-sync decided = Option A, cherry-picked #42 DPMI + #36 OOM + CHANGELOG onto release line, unpushed pending build-verify). Prior checkpoint 2026-06-06.
+Updated: 2026-07-18 (reconciled the "OHCI driver 7" Claude.ai sandbox session — see "OHCI-session reconciliation" below: #43 no-VCPI lockup documented on the release line as `7cd18a8`, tester deliverables filed to the sibling folder. Release line now 7 ahead of origin `d39f839`. Prior update 2026-07-17 doc-drift fix: release line was ahead of origin `d39f839` by the 5-commit named stack below plus this true-up commit; the earlier "+4" miscounted by omitting the doc-update commit that carried it. Housekeeping: PRs #40-42 confirmed MERGED; 5 stale merged source branches deleted from origin; session deliverables moved out of repo root; v2-line master-sync decided = Option A, cherry-picked #42 DPMI + #36 OOM + CHANGELOG onto release line, unpushed pending build-verify). Prior checkpoint 2026-06-06.
+
+## OHCI-session reconciliation (2026-07-18)
+
+The Claude.ai chat **"OHCI driver 7"** (2026-06-27 → 07-18) ran in an
+Anthropic sandbox that *did* have an Open Watcom + QEMU toolchain (this local
+env does not). It was seeded from `usbddos-migration-2026-06-07.zip` — a
+**June-7 rebuild-on-upstream** of the v2 line (`v2/release` @ `b63ac6b`,
+`v2/dbg` @ `f077d04`, both rebased onto `upstream/master` `0d2d6b6`). That
+seed is a *different reconciliation* of the same content than this canonical
+line: `b63ac6b` ≙ our `36abbc7` (same CHANGELOG subject/author date, SHA
+rewritten at the 06-07 sync) and `f077d04` ≙ our `088a15c`. **This local
+`fix/msc-transport-rewrite` is canonical** (Option A: stay diverged,
+cherry-pick #42+#36); it is *not* behind the sandbox.
+
+The sandbox and this session **cannot see each other** — coordination is by
+human courier (file upload) only. The sandbox container was later recycled;
+its git repo and 4 session commits (`a9e7df8`, `6ef1503`, `3c6330d`,
+`724679a`) are gone **as objects** (no bundle was cut — the insurance step
+that would have prevented it). Recovered anyway:
+
+- **#43 doc (`a9e7df8`)** — the one commit worth keeping. Exact content
+  recovered *verbatim from the session export* (both README + CHANGELOG
+  `str_replace` calls) and re-landed here as a **fresh** commit `7cd18a8`
+  (NOT a cherry-pick; new SHA, same substance; README note adapted to this
+  line's structure since our README has no "Memory managers and XMS" section).
+- **Tester binaries** survived in the sandbox `outputs/` and are filed to
+  `../USBDDOS-session-deliverables/ohci7-issue43-click1-2026-07-18/`:
+  `usbddos-pmdiag2-43.zip`, `usbddos-pmdiag-43.zip`,
+  `usbddos-clicktrace-issue2.zip`, + 4 serial logs (diagA/B, pd2, ctinject).
+
+**Upstream #43 (peterschmidl, AMD Am5x86 / UMC UM8881F) = documented & closed
+by decision.** Real-hardware-only Heisenbug in the raw no-EMM386 PM switch;
+two hypotheses (A20, L1-cache) knocked down by his data; and his board has **no
+USB host controller** (USB kbd rides USB→PS/2→AT adapters), so even a perfect
+fix helps him nothing. Workaround = load EMM386 (VCPI path). Closing reply to
+Peter was drafted in the sandbox session (his voice), status unconfirmed-sent.
+
+**Still-live OHCI-session items, both blocked on the tester (hjnijlunsing, #2):**
+- **CLICK-1** (Lemmings click-drop on the INT15 path): the `CLICKTRACE`
+  instrumented build (`usbddos-clicktrace-issue2.zip`) is **built and ready
+  but NOT sent** — counts left-button edges at raw arrival (`seenD/U`) vs
+  INT15 delivery (`delD/U`) into an in-memory ring, dumped via `CLICKTRC.COM`
+  + private INT15 `AX=C2FFh`. Seen-side QMP-validated; delivered-side couldn't
+  be exercised in QEMU (CTMOUSE bound to QEMU's native PS/2 mouse). **Open
+  decision: send to hjnijlunsing now, or after the disk thread.**
+- **#2 disk/legacy**: still waiting on his serial logs from the earlier
+  "hiatus, need info" message.
 
 ## Housekeeping done 2026-07-17
 - **PRs #40/#41/#42 all MERGED** (verified via GitHub API). Their `pr/*`
@@ -39,7 +86,7 @@ Updated: 2026-07-17 (doc-drift fix: release line is ahead of origin `d39f839` by
 
 | Branch | Head | Contents |
 |---|---|---|
-| `fix/msc-transport-rewrite` (release line) | local tip (origin anchored at `d39f839`; unpushed stack = the 5 named commits below + this doc-drift-fix commit) | P-series + `0c2fa7d` + **control-timeout** (`b178198`) + **device-pool fix** (`5d85eab`) + gitignore (`d39f839`) + **cherry-picked #42 DPMI** (`865a254`) + **#36 OOM** (`10a7125`) + CHANGELOG (`abd9683`) + status-doc tracking (`776a7b7`) + branch-table true-up (`2318013`) — all unpushed pending build-verify. (Count is fragile: every status-doc commit adds one more unpushed commit, so track the origin anchor `d39f839` + named stack, not a raw integer.) |
+| `fix/msc-transport-rewrite` (release line) | local tip (origin anchored at `d39f839`; unpushed stack = the 5 named commits below + this doc-drift-fix commit) | P-series + `0c2fa7d` + **control-timeout** (`b178198`) + **device-pool fix** (`5d85eab`) + gitignore (`d39f839`) + **cherry-picked #42 DPMI** (`865a254`) + **#36 OOM** (`10a7125`) + CHANGELOG (`abd9683`) + status-doc tracking (`776a7b7`) + branch-table true-up (`2318013`) + drift-fix (`08cbb41`) + **#43 no-VCPI lockup doc, reconstructed** (`7cd18a8`) — all unpushed pending build-verify. (Count is fragile: every status-doc commit adds one more unpushed commit, so track the origin anchor `d39f839` + named stack, not a raw integer. As of 2026-07-18: 7 ahead + this status-doc update = 8.) |
 | `dbg/combined-trace` | `088a15c` | release base + traces + 8042 bridge (`4df062e`) + **DPMI nested-IRQ fix** (`fd29498`, = PR #42, merged) + **INT15h/C2xx PS/2 emulation** (`088a15c`) — awaiting metal Test G before landing on release line |
 | ~~`pr/control-timeout`~~ | — | **PR #40 MERGED**; branch deleted |
 | ~~`pr/device-pool`~~ | — | **PR #41 MERGED**; branch deleted |
